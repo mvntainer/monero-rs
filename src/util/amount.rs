@@ -1,2198 +1,1427 @@
-// Rust Monero Library
-// Written in 2021-2022 by
-//   Monero Rust Contributors
+// Copyright 2019-2022 Artem Vorotnikov and Monero Rust Contributors
 //
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
+//   http://www.apache.org/licenses/LICENSE-2.0
 //
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-//! Amounts, denominations, and errors types and arithmetic.
+//! Monero daemon and wallet RPC library written in asynchronous Rust.
 //!
-//! This implementation is based on
-//! [`rust-bitcoin`](https://github.com/rust-bitcoin/rust-bitcoin/blob/20f1543f79066886b3ae12fff4f5bb58dd8cc1ab/src/util/amount.rs)
-//! `Amount` and `SignedAmount` implementations.
+//! ## Usage
 //!
+//! Generate the base [`RpcClient`] with [`RpcClientBuilder`] and use the methods
+//! [`RpcClient::daemon`], [`RpcClient::daemon_rpc`], or [`RpcClient::wallet`] to retrieve the
+//! specialized RPC client.
+//!
+//! On a [`DaemonJsonRpcClient`] you can call [`DaemonJsonRpcClient::regtest`] to get a
+//! [`RegtestDaemonJsonRpcClient`] instance that enables RPC call specific to regtest such as
+//! [`RegtestDaemonJsonRpcClient::generate_blocks`].
+//!
+//! ```rust
+//! # fn main() -> anyhow::Result<()> {
+//! use monero_rpc::RpcClientBuilder;
+//!
+//! let client = RpcClientBuilder::new()
+//!     .build("http://node.monerooutreach.org:18081")?;
+//! let daemon = client.daemon();
+//! let regtest_daemon = daemon.regtest();
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The client can be initialized with a proxy, for example a socks5 proxy to enable Tor:
+//!
+//! ```rust
+//! # fn main() -> anyhow::Result<()> {
+//! use monero_rpc::RpcClientBuilder;
+//!
+//! let client = RpcClientBuilder::new()
+//!     .proxy_address("socks5://127.0.0.1:9050")
+//!     .build("http://node.monerooutreach.org:18081")?;
+//! # Ok(())
+//! # }
+//! ```
 
-use std::cmp::Ordering;
-use std::default;
-use std::fmt::{self, Write};
-use std::ops;
-use std::str::FromStr;
+#![cfg_attr(docsrs, feature(doc_cfg))]
+// Coding conventions
+#![forbid(unsafe_code)]
 
-use thiserror::Error;
+pub use monero;
 
-/// A set of denominations in which amounts can be expressed.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub enum Denomination {
-    /// xmr
-    Monero,
-    /// millinero
-    Millinero,
-    /// micronero
-    Micronero,
-    /// nanonero
-    Nanonero,
-    /// piconero
-    Piconero,
+#[macro_use]
+mod util;
+mod models;
+
+pub use self::{models::*, util::*};
+
+use jsonrpc_core::types::{Id, *};
+use monero::{
+    cryptonote::{hash::Hash as CryptoNoteHash, subaddress},
+    util::{address::PaymentId, amount},
+    Address, Amount,
+};
+use serde::{de::IgnoredAny, Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::{json, Value};
+use std::{
+    collections::HashMap,
+    convert::TryFrom,
+    fmt::Debug,
+    iter::{empty, once},
+    num::NonZeroU64,
+    ops::{Deref, RangeInclusive},
+    sync::Arc,
+};
+use tracing::*;
+use uuid::Uuid;
+
+#[cfg(feature = "rpc_authentication")]
+use diqwest::WithDigestAuth;
+
+enum RpcParams {
+    Array(Box<dyn Iterator<Item = Value> + Send + 'static>),
+    Map(Box<dyn Iterator<Item = (String, Value)> + Send + 'static>),
+    None,
 }
 
-impl Denomination {
-    /// The number of decimal places more than a piconero.
-    fn precision(self) -> i32 {
-        match self {
-            Denomination::Monero => -12,
-            Denomination::Millinero => -9,
-            Denomination::Micronero => -6,
-            Denomination::Nanonero => -3,
-            Denomination::Piconero => 0,
+/// Method of authentication to be used when connecting to an RPC endpoint.
+#[cfg(feature = "rpc_authentication")]
+#[cfg_attr(docsrs, doc(cfg(feature = "rpc_authentication")))]
+#[derive(Clone, Debug)]
+pub enum RpcAuthentication {
+    /// Connects with a username and password.
+    Credentials { username: String, password: String },
+    /// Do not authenticate when connecting to the RPC.
+    None,
+}
+
+impl RpcParams {
+    fn array<A>(v: A) -> Self
+    where
+        A: Iterator<Item = Value> + Send + 'static,
+    {
+        RpcParams::Array(Box::new(v))
+    }
+
+    fn map<M>(v: M) -> Self
+    where
+        M: Iterator<Item = (&'static str, Value)> + Send + 'static,
+    {
+        RpcParams::Map(Box::new(v.map(|(k, v)| (k.to_string(), v))))
+    }
+}
+
+impl From<RpcParams> for Params {
+    fn from(value: RpcParams) -> Self {
+        match value {
+            RpcParams::Map(v) => Params::Map(v.collect()),
+            RpcParams::Array(v) => Params::Array(v.collect()),
+            RpcParams::None => Params::None,
         }
     }
 }
 
-impl fmt::Display for Denomination {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str(match *self {
-            Denomination::Monero => "xmr",
-            Denomination::Millinero => "millinero",
-            Denomination::Micronero => "micronero",
-            Denomination::Nanonero => "nanonero",
-            Denomination::Piconero => "piconero",
-        })
-    }
+#[derive(Clone, Debug)]
+struct RemoteCaller {
+    http_client: reqwest::Client,
+    addr: String,
+    #[cfg(feature = "rpc_authentication")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "rpc_authentication")))]
+    rpc_auth: RpcAuthentication,
 }
 
-impl FromStr for Denomination {
-    type Err = ParsingError;
+impl RemoteCaller {
+    async fn json_rpc_call(
+        &self,
+        method: &'static str,
+        params: RpcParams,
+    ) -> anyhow::Result<jsonrpc_core::Result<Value>> {
+        let client = self.http_client.clone();
+        let uri = format!("{}/json_rpc", &self.addr);
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "xmr" | "XMR" | "monero" => Ok(Denomination::Monero),
-            "millinero" | "mXMR" => Ok(Denomination::Millinero),
-            "micronero" | "µXMR" | "mcXMR" => Ok(Denomination::Micronero),
-            "nanonero" | "nXMR" => Ok(Denomination::Nanonero),
-            "piconero" | "pXMR" => Ok(Denomination::Piconero),
-            d => Err(ParsingError::UnknownDenomination(d.to_owned())),
-        }
-    }
-}
-
-/// An error during amount parsing.
-#[derive(Error, Debug, Clone, PartialEq, Eq)]
-pub enum ParsingError {
-    /// Amount is negative.
-    #[error("Amount is negative")]
-    Negative,
-    /// Amount is too big to fit inside the type.
-    #[error("Amount is too big to fit inside the type")]
-    TooBig,
-    /// Amount has higher precision than supported by the type.
-    #[error("Amount has higher precision than supported by the type")]
-    TooPrecise,
-    /// Invalid number format.
-    #[error("Invalid number format")]
-    InvalidFormat,
-    /// Input string was too large.
-    #[error("Input string was too large")]
-    InputTooLarge,
-    /// Invalid character in input.
-    #[error("Invalid character in input: {0}")]
-    InvalidCharacter(char),
-    /// The denomination was unknown.
-    #[error("The denomination was unknown: {0}")]
-    UnknownDenomination(String),
-}
-
-fn is_too_precise(s: &str, precision: usize) -> bool {
-    s.contains('.') || precision >= s.len() || s.chars().rev().take(precision).any(|d| d != '0')
-}
-
-/// Parse decimal string in the given denomination into a piconero value and a bool indicator for a
-/// negative amount.
-fn parse_signed_to_piconero(mut s: &str, denom: Denomination) -> Result<(bool, u64), ParsingError> {
-    if s.is_empty() {
-        return Err(ParsingError::InvalidFormat);
-    }
-    if s.len() > 50 {
-        return Err(ParsingError::InputTooLarge);
-    }
-
-    let is_negative = s.starts_with('-');
-    if is_negative {
-        if s.len() == 1 {
-            return Err(ParsingError::InvalidFormat);
-        }
-        s = &s[1..];
-    }
-
-    let max_decimals = {
-        // The difference in precision between native (piconero) and desired denomination.
-        let precision_diff = -denom.precision();
-        if precision_diff < 0 {
-            // If precision diff is negative, this means we are parsing
-            // into a less precise amount. That is not allowed unless
-            // there are no decimals and the last digits are zeroes as
-            // many as the difference in precision.
-            let last_n = precision_diff.unsigned_abs() as usize;
-            if is_too_precise(s, last_n) {
-                return Err(ParsingError::TooPrecise);
-            }
-            s = &s[0..s.len() - last_n];
-            0
-        } else {
-            precision_diff
-        }
-    };
-
-    let mut decimals = None;
-    let mut value: u64 = 0; // as piconero
-    for c in s.chars() {
-        match c {
-            '0'..='9' => {
-                // Do `value = 10 * value + digit`, catching overflows.
-                match 10_u64.checked_mul(value) {
-                    None => return Err(ParsingError::TooBig),
-                    Some(val) => match val.checked_add((c as u8 - b'0') as u64) {
-                        None => return Err(ParsingError::TooBig),
-                        Some(val) => value = val,
-                    },
-                }
-                // Increment the decimal digit counter if past decimal.
-                decimals = match decimals {
-                    None => None,
-                    Some(d) if d < max_decimals => Some(d + 1),
-                    _ => return Err(ParsingError::TooPrecise),
-                };
-            }
-            '.' => match decimals {
-                None => decimals = Some(0),
-                // Double decimal dot.
-                _ => return Err(ParsingError::InvalidFormat),
-            },
-            c => return Err(ParsingError::InvalidCharacter(c)),
-        }
-    }
-
-    // Decimally shift left by `max_decimals - decimals`.
-    let scale_factor = max_decimals - decimals.unwrap_or(0);
-    for _ in 0..scale_factor {
-        value = match 10_u64.checked_mul(value) {
-            Some(v) => v,
-            None => return Err(ParsingError::TooBig),
+        let method_call = MethodCall {
+            jsonrpc: Some(Version::V2),
+            method: method.to_string(),
+            params: params.into(),
+            id: Id::Str(Uuid::new_v4().to_string()),
         };
-    }
 
-    Ok((is_negative, value))
-}
+        trace!("Sending JSON-RPC method call: {:?}", method_call);
 
-/// Format the given piconero amount in the given denomination without including the denomination.
-fn fmt_piconero_in(
-    piconero: u64,
-    negative: bool,
-    f: &mut dyn fmt::Write,
-    denom: Denomination,
-) -> fmt::Result {
-    if negative {
-        f.write_str("-")?;
-    }
+        let req = client.post(&uri).json(&method_call);
 
-    let precision = denom.precision();
-    match precision.cmp(&0) {
-        Ordering::Greater => {
-            // add zeroes in the end
-            let width = precision as usize;
-            write!(f, "{}{:0width$}", piconero, 0, width = width)?;
-        }
-        Ordering::Less => {
-            // need to inject a comma in the number
-            let nb_decimals = precision.unsigned_abs() as usize;
-            let real = format!("{:0width$}", piconero, width = nb_decimals);
-            if real.len() == nb_decimals {
-                write!(f, "0.{}", &real[real.len() - nb_decimals..])?;
-            } else {
-                write!(
-                    f,
-                    "{}.{}",
-                    &real[0..(real.len() - nb_decimals)],
-                    &real[real.len() - nb_decimals..]
-                )?;
-            }
-        }
-        Ordering::Equal => write!(f, "{}", piconero)?,
-    }
-    Ok(())
-}
+        #[cfg(not(feature = "rpc_authentication"))]
+        let rsp = req.send().await?.json::<response::Output>().await?;
 
-/// Represent an unsigned quantity of Monero, internally as piconero.
-///
-/// The [`Amount`] type can be used to express Monero amounts that supports arithmetic and
-/// conversion to various denominations.
-///
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Amount(u64);
-
-impl Amount {
-    /// The zero amount.
-    pub const ZERO: Amount = Amount(0);
-    /// Exactly one piconero.
-    pub const ONE_PICO: Amount = Amount(1);
-    /// Exactly one monero.
-    pub const ONE_XMR: Amount = Amount(1_000_000_000_000);
-
-    /// Create an [`Amount`] with piconero precision and the given number of piconero.
-    pub fn from_pico(piconero: u64) -> Amount {
-        Amount(piconero)
-    }
-
-    /// Get the number of piconeros in this [`Amount`].
-    pub fn as_pico(self) -> u64 {
-        self.0
-    }
-
-    /// The maximum value of an [`Amount`].
-    pub fn max_value() -> Amount {
-        Amount(u64::max_value())
-    }
-
-    /// The minimum value of an [`Amount`].
-    pub fn min_value() -> Amount {
-        Amount(u64::min_value())
-    }
-
-    /// Convert from a value expressing moneros to an [`Amount`].
-    pub fn from_xmr(xmr: f64) -> Result<Amount, ParsingError> {
-        Amount::from_float_in(xmr, Denomination::Monero)
-    }
-
-    /// Parse a decimal string as a value in the given denomination.
-    ///
-    /// Note: This only parses the value string. If you want to parse a value with denomination,
-    /// use [`FromStr`].
-    pub fn from_str_in(s: &str, denom: Denomination) -> Result<Amount, ParsingError> {
-        let (negative, piconero) = parse_signed_to_piconero(s, denom)?;
-        if negative {
-            return Err(ParsingError::Negative);
-        }
-        if piconero > i64::max_value() as u64 {
-            return Err(ParsingError::TooBig);
-        }
-        Ok(Amount::from_pico(piconero))
-    }
-
-    /// Parses amounts with denomination suffix like they are produced with
-    /// `to_string_with_denomination` or with [`fmt::Display`]. If you want to parse only the
-    /// amount without the denomination, use `from_str_in`.
-    pub fn from_str_with_denomination(s: &str) -> Result<Amount, ParsingError> {
-        let mut split = s.splitn(3, ' ');
-        let amt_str = split.next().unwrap();
-        let denom_str = split.next().ok_or(ParsingError::InvalidFormat)?;
-        if split.next().is_some() {
-            return Err(ParsingError::InvalidFormat);
-        }
-
-        Amount::from_str_in(amt_str, denom_str.parse()?)
-    }
-
-    /// Express this [`Amount`] as a floating-point value in the given denomination.
-    ///
-    /// Please be aware of the risk of using floating-point numbers.
-    pub fn to_float_in(self, denom: Denomination) -> f64 {
-        f64::from_str(&self.to_string_in(denom)).unwrap()
-    }
-
-    /// Express this [`Amount`] as a floating-point value in Monero.
-    ///
-    /// Equivalent to `to_float_in(Denomination::Monero)`.
-    ///
-    /// Please be aware of the risk of using floating-point numbers.
-    pub fn as_xmr(self) -> f64 {
-        self.to_float_in(Denomination::Monero)
-    }
-
-    /// Convert this [`Amount`] in floating-point notation with a given denomination. Can return
-    /// error if the amount is too big, too precise or negative.
-    ///
-    /// Please be aware of the risk of using floating-point numbers.
-    pub fn from_float_in(value: f64, denom: Denomination) -> Result<Amount, ParsingError> {
-        if value < 0.0 {
-            return Err(ParsingError::Negative);
-        }
-        // This is inefficient, but the safest way to deal with this. The parsing logic is safe.
-        // Any performance-critical application should not be dealing with floats.
-        Amount::from_str_in(&value.to_string(), denom)
-    }
-
-    /// Format the value of this [`Amount`] in the given denomination.
-    ///
-    /// Does not include the denomination.
-    pub fn fmt_value_in(self, f: &mut dyn fmt::Write, denom: Denomination) -> fmt::Result {
-        fmt_piconero_in(self.as_pico(), false, f, denom)
-    }
-
-    /// Get a string number of this [`Amount`] in the given denomination.
-    ///
-    /// Does not include the denomination.
-    pub fn to_string_in(self, denom: Denomination) -> String {
-        let mut buf = String::new();
-        self.fmt_value_in(&mut buf, denom).unwrap();
-        buf
-    }
-
-    /// Get a formatted string of this [`Amount`] in the given denomination, suffixed with the
-    /// abbreviation for the denomination.
-    pub fn to_string_with_denomination(self, denom: Denomination) -> String {
-        let mut buf = String::new();
-        self.fmt_value_in(&mut buf, denom).unwrap();
-        write!(buf, " {}", denom).unwrap();
-        buf
-    }
-
-    // Some arithmetic that doesn't fit in `std::ops` traits.
-
-    /// Checked addition.
-    /// Returns [`None`] if overflow occurred.
-    pub fn checked_add(self, rhs: Amount) -> Option<Amount> {
-        self.0.checked_add(rhs.0).map(Amount)
-    }
-
-    /// Checked subtraction.
-    /// Returns [`None`] if overflow occurred.
-    pub fn checked_sub(self, rhs: Amount) -> Option<Amount> {
-        self.0.checked_sub(rhs.0).map(Amount)
-    }
-
-    /// Checked multiplication.
-    /// Returns [`None`] if overflow occurred.
-    pub fn checked_mul(self, rhs: u64) -> Option<Amount> {
-        self.0.checked_mul(rhs).map(Amount)
-    }
-
-    /// Checked integer division.
-    /// Be aware that integer division loses the remainder if no exact division
-    /// can be made.
-    /// Returns [`None`] if overflow occurred.
-    pub fn checked_div(self, rhs: u64) -> Option<Amount> {
-        self.0.checked_div(rhs).map(Amount)
-    }
-
-    /// Checked remainder.
-    /// Returns [`None`] if overflow occurred.
-    pub fn checked_rem(self, rhs: u64) -> Option<Amount> {
-        self.0.checked_rem(rhs).map(Amount)
-    }
-
-    /// Convert to a signed amount.
-    pub fn to_signed(self) -> Result<SignedAmount, ParsingError> {
-        if self.as_pico() > SignedAmount::max_value().as_pico() as u64 {
-            Err(ParsingError::TooBig)
+        #[cfg(feature = "rpc_authentication")]
+        let rsp = if let RpcAuthentication::Credentials { username, password } = &self.rpc_auth {
+            req.send_with_digest_auth(username, password)
+                .await?
+                .json::<response::Output>()
+                .await?
         } else {
-            Ok(SignedAmount::from_pico(self.as_pico() as i64))
-        }
+            req.send().await?.json::<response::Output>().await?
+        };
+
+        trace!("Received JSON-RPC response: {:?}", rsp);
+        let v = jsonrpc_core::Result::<Value>::from(rsp);
+        Ok(v)
+    }
+
+    async fn daemon_rpc_call<T>(&self, method: &'static str, params: RpcParams) -> anyhow::Result<T>
+    where
+        T: for<'de> Deserialize<'de> + Send + 'static + Debug,
+    {
+        let client = self.http_client.clone();
+        let uri = format!("{}/{}", &self.addr, method);
+
+        let json_params: Params = params.into();
+
+        trace!(
+            "Sending daemon RPC call: {:?}, with params {:?}",
+            method,
+            json_params
+        );
+
+        let req = client.post(uri).json(&json_params);
+
+        #[cfg(not(feature = "rpc_authentication"))]
+        let rsp = req.send().await?.json::<T>().await?;
+
+        #[cfg(feature = "rpc_authentication")]
+        let rsp = if let RpcAuthentication::Credentials { username, password } = &self.rpc_auth {
+            req.send_with_digest_auth(username, password)
+                .await?
+                .json::<T>()
+                .await?
+        } else {
+            req.send().await?.json::<T>().await?
+        };
+
+        trace!("Received daemon RPC response: {:?}", rsp);
+
+        Ok(rsp)
     }
 }
 
-impl default::Default for Amount {
+#[derive(Clone, Debug)]
+struct CallerWrapper(Arc<RemoteCaller>);
+
+impl CallerWrapper {
+    async fn request<T>(&self, method: &'static str, params: RpcParams) -> anyhow::Result<T>
+    where
+        T: for<'de> Deserialize<'de> + Send + 'static,
+    {
+        let c = self.0.json_rpc_call(method, params);
+        Ok(serde_json::from_value(c.await??)?)
+    }
+
+    async fn daemon_rpc_request<T>(
+        &self,
+        method: &'static str,
+        params: RpcParams,
+    ) -> anyhow::Result<T>
+    where
+        T: for<'de> Deserialize<'de> + Send + 'static + Debug,
+    {
+        let c = self.0.daemon_rpc_call(method, params).await?;
+        Ok(serde_json::from_value(c)?)
+    }
+}
+
+/// Base RPC client. It is useless on its own, please see the attached methods to see how to
+/// transform it into a specialized client.
+#[derive(Clone, Debug)]
+pub struct RpcClient {
+    inner: CallerWrapper,
+}
+
+#[derive(Clone, Debug)]
+struct RpcClientConfig {
+    #[cfg(feature = "rpc_authentication")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "rpc_authentication")))]
+    rpc_auth: RpcAuthentication,
+    proxy_address: Option<String>,
+}
+
+/// Builder for generating a configured [`RpcClient`].
+#[derive(Clone, Debug)]
+pub struct RpcClientBuilder {
+    config: RpcClientConfig,
+}
+
+impl Default for RpcClientBuilder {
     fn default() -> Self {
-        Amount::ZERO
+        Self::new()
     }
 }
 
-impl fmt::Debug for Amount {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Amount({:.12} xmr)", self.as_xmr())
-    }
-}
-
-// No one should depend on a binding contract for Display for this type.
-// Just using Monero denominated string.
-impl fmt::Display for Amount {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        self.fmt_value_in(f, Denomination::Monero)?;
-        write!(f, " {}", Denomination::Monero)
-    }
-}
-
-impl ops::Add for Amount {
-    type Output = Amount;
-
-    fn add(self, rhs: Amount) -> Self::Output {
-        self.checked_add(rhs).expect("Amount addition error")
-    }
-}
-
-impl ops::AddAssign for Amount {
-    fn add_assign(&mut self, other: Amount) {
-        *self = *self + other
-    }
-}
-
-impl ops::Sub for Amount {
-    type Output = Amount;
-
-    fn sub(self, rhs: Amount) -> Self::Output {
-        self.checked_sub(rhs).expect("Amount subtraction error")
-    }
-}
-
-impl ops::SubAssign for Amount {
-    fn sub_assign(&mut self, other: Amount) {
-        *self = *self - other
-    }
-}
-
-impl ops::Rem<u64> for Amount {
-    type Output = Amount;
-
-    fn rem(self, modulus: u64) -> Self {
-        self.checked_rem(modulus).expect("Amount remainder error")
-    }
-}
-
-impl ops::RemAssign<u64> for Amount {
-    fn rem_assign(&mut self, modulus: u64) {
-        *self = *self % modulus
-    }
-}
-
-impl ops::Mul<u64> for Amount {
-    type Output = Amount;
-
-    fn mul(self, rhs: u64) -> Self::Output {
-        self.checked_mul(rhs).expect("Amount multiplication error")
-    }
-}
-
-impl ops::MulAssign<u64> for Amount {
-    fn mul_assign(&mut self, rhs: u64) {
-        *self = *self * rhs
-    }
-}
-
-impl ops::Div<u64> for Amount {
-    type Output = Amount;
-
-    fn div(self, rhs: u64) -> Self::Output {
-        self.checked_div(rhs).expect("Amount division error")
-    }
-}
-
-impl ops::DivAssign<u64> for Amount {
-    fn div_assign(&mut self, rhs: u64) {
-        *self = *self / rhs
-    }
-}
-
-impl FromStr for Amount {
-    type Err = ParsingError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Amount::from_str_with_denomination(s)
-    }
-}
-
-/// Represent an signed quantity of Monero, internally as signed monero.
-///
-/// The [`SignedAmount`] type can be used to express Monero amounts that supports arithmetic and
-/// conversion to various denominations.
-///
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SignedAmount(i64);
-
-impl SignedAmount {
-    /// The zero amount.
-    pub const ZERO: SignedAmount = SignedAmount(0);
-    /// Exactly one piconero.
-    pub const ONE_PICO: SignedAmount = SignedAmount(1);
-    /// Exactly one monero.
-    pub const ONE_XMR: SignedAmount = SignedAmount(1_000_000_000_000);
-
-    /// Create an [`SignedAmount`] with piconero precision and the given number of piconeros.
-    pub fn from_pico(piconero: i64) -> SignedAmount {
-        SignedAmount(piconero)
-    }
-
-    /// Get the number of piconeros in this [`SignedAmount`].
-    pub fn as_pico(self) -> i64 {
-        self.0
-    }
-
-    /// The maximum value of an [`SignedAmount`].
-    pub fn max_value() -> SignedAmount {
-        SignedAmount(i64::max_value())
-    }
-
-    /// The minimum value of an [`SignedAmount`].
-    pub fn min_value() -> SignedAmount {
-        SignedAmount(i64::min_value())
-    }
-
-    /// Convert from a value expressing moneros to an [`SignedAmount`].
-    pub fn from_xmr(xmr: f64) -> Result<SignedAmount, ParsingError> {
-        SignedAmount::from_float_in(xmr, Denomination::Monero)
-    }
-
-    /// Parse a decimal string as a value in the given denomination.
-    ///
-    /// Note: This only parses the value string.  If you want to parse a value with denomination,
-    /// use [`FromStr`].
-    pub fn from_str_in(s: &str, denom: Denomination) -> Result<SignedAmount, ParsingError> {
-        let (negative, piconero) = parse_signed_to_piconero(s, denom)?;
-        if piconero > i64::max_value() as u64 {
-            return Err(ParsingError::TooBig);
+impl RpcClientBuilder {
+    /// Creates a new builder with no configuration.
+    pub fn new() -> RpcClientBuilder {
+        RpcClientBuilder {
+            config: RpcClientConfig {
+                #[cfg(feature = "rpc_authentication")]
+                rpc_auth: RpcAuthentication::None,
+                proxy_address: None,
+            },
         }
-        Ok(match negative {
-            true => SignedAmount(-(piconero as i64)),
-            false => SignedAmount(piconero as i64),
+    }
+
+    /// Configures the authentication to use when connecting to RPC.
+    #[cfg(feature = "rpc_authentication")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "rpc_authentication")))]
+    pub fn rpc_authentication(mut self, auth: RpcAuthentication) -> Self {
+        self.config.rpc_auth = auth;
+        self
+    }
+
+    /// Adds a proxy to the generated client.
+    pub fn proxy_address(mut self, proxy: impl Into<String>) -> Self {
+        self.config.proxy_address = Some(proxy.into());
+        self
+    }
+
+    /// Build and return the fully configured RPC client.
+    pub fn build(self, addr: impl Into<String>) -> anyhow::Result<RpcClient> {
+        let config = self.config;
+        let http_client_builder = reqwest::ClientBuilder::new();
+        let http_client = if let Some(proxy_address) = config.proxy_address {
+            http_client_builder
+                .proxy(reqwest::Proxy::all(proxy_address)?)
+                .build()?
+        } else {
+            http_client_builder.build()?
+        };
+        Ok(RpcClient {
+            inner: CallerWrapper(Arc::new(RemoteCaller {
+                http_client,
+                addr: addr.into(),
+                #[cfg(feature = "rpc_authentication")]
+                rpc_auth: config.rpc_auth,
+            })),
+        })
+    }
+}
+
+impl RpcClient {
+    /// Create a new generic RPC client that can be transformed into specialized client.
+    ///
+    /// **You should prefer using the [`RpcClientBuilder`] instead.**
+    #[deprecated(note = "Use should prefer using the builder interface instead!")]
+    pub fn new(addr: String) -> anyhow::Result<Self> {
+        RpcClientBuilder::new().build(addr)
+    }
+
+    /// Transform the client into the specialized `DaemonJsonRpcClient` that interacts with JSON RPC
+    /// methods on daemon.
+    pub fn daemon(self) -> DaemonJsonRpcClient {
+        let Self { inner } = self;
+        DaemonJsonRpcClient { inner }
+    }
+
+    /// Transform the client into the specialized `DaemonRpcClient` that interacts with methods on
+    /// daemon called with their own extensions.
+    pub fn daemon_rpc(self) -> DaemonRpcClient {
+        let Self { inner } = self;
+        DaemonRpcClient { inner }
+    }
+
+    /// Transform the client into the specialized `WalletClient` that interacts with a Monero
+    /// wallet RPC daemon.
+    pub fn wallet(self) -> WalletClient {
+        let Self { inner } = self;
+        WalletClient { inner }
+    }
+}
+
+/// Result of [`RpcClient::daemon`] to interact with JSON RPC Methods on daemon.
+///
+/// The majority of monerod RPC calls use the daemon's json_rpc interface to request various bits
+/// of information. These methods all follow a similar structure.
+///
+/// ```rust
+/// # fn main() -> anyhow::Result<()> {
+/// use monero_rpc::RpcClientBuilder;
+///
+/// let client = RpcClientBuilder::new()
+///     .build("http://node.monerooutreach.org:18081")?;
+/// let daemon = client.daemon();
+/// let regtest_daemon = daemon.regtest();
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Debug)]
+pub struct DaemonJsonRpcClient {
+    inner: CallerWrapper,
+}
+
+/// Result of [`DaemonJsonRpcClient::regtest`] to enable methods for daemons in regtest mode.
+#[derive(Clone, Debug)]
+pub struct RegtestDaemonJsonRpcClient(pub DaemonJsonRpcClient);
+
+impl Deref for RegtestDaemonJsonRpcClient {
+    type Target = DaemonJsonRpcClient;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// Selector for daemon `get_block_header`.
+pub enum GetBlockHeaderSelector {
+    /// Select the last block.
+    Last,
+    /// Select the block by its hash.
+    Hash(BlockHash),
+    /// Select the block by its height.
+    Height(u64),
+}
+
+impl DaemonJsonRpcClient {
+    /// Look up how many blocks are in the longest chain known to the node.
+    pub async fn get_block_count(&self) -> anyhow::Result<NonZeroU64> {
+        #[derive(Deserialize)]
+        struct Rsp {
+            count: NonZeroU64,
+        }
+
+        Ok(self
+            .inner
+            .request::<MoneroResult<Rsp>>("get_block_count", RpcParams::array(empty()))
+            .await?
+            .into_inner()
+            .count)
+    }
+
+    /// Look up a block's hash by its height.
+    pub async fn on_get_block_hash(&self, height: u64) -> anyhow::Result<BlockHash> {
+        let res = self
+            .inner
+            .request::<HashString<BlockHash>>(
+                "on_get_block_hash",
+                RpcParams::array(once(height.into())),
+            )
+            .await
+            .map(|v| v.0)?;
+
+        // see https://github.com/monero-rs/monero-rpc-rs/issues/58 for rationality
+        if res == BlockHash::from_slice(&[0; 32]) {
+            Err(anyhow::Error::msg(format!(
+                "Invalid height {} supplied.",
+                height
+            )))
+        } else {
+            Ok(res)
+        }
+    }
+
+    /// Get a block template on which mining a new block.
+    pub async fn get_block_template(
+        &self,
+        wallet_address: Address,
+        reserve_size: u64,
+    ) -> anyhow::Result<BlockTemplate> {
+        Ok(self
+            .inner
+            .request::<MoneroResult<BlockTemplate>>(
+                "get_block_template",
+                RpcParams::map(
+                    empty()
+                        .chain(once((
+                            "wallet_address",
+                            serde_json::to_value(wallet_address).unwrap(),
+                        )))
+                        .chain(once(("reserve_size", reserve_size.into()))),
+                ),
+            )
+            .await?
+            .into_inner())
+    }
+
+    /// Submit a mined block to the network.
+    pub async fn submit_block(&self, block_blob_data: String) -> anyhow::Result<()> {
+        self.inner
+            .request::<IgnoredAny>(
+                "submit_block",
+                RpcParams::array(once(block_blob_data.into())),
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    /// Retrieve block header information matching selected filter.
+    pub async fn get_block_header(
+        &self,
+        selector: GetBlockHeaderSelector,
+    ) -> anyhow::Result<BlockHeaderResponse> {
+        #[derive(Deserialize)]
+        struct Rsp {
+            block_header: BlockHeaderResponseR,
+        }
+
+        let (request, params) = match selector {
+            GetBlockHeaderSelector::Last => ("get_last_block_header", RpcParams::None),
+            GetBlockHeaderSelector::Hash(hash) => (
+                "get_block_header_by_hash",
+                RpcParams::map(
+                    Some(("hash", serde_json::to_value(HashString(hash)).unwrap())).into_iter(),
+                ),
+            ),
+            GetBlockHeaderSelector::Height(height) => (
+                "get_block_header_by_height",
+                RpcParams::map(Some(("height", height.into())).into_iter()),
+            ),
+        };
+
+        Ok(self
+            .inner
+            .request::<Rsp>(request, params)
+            .await?
+            .block_header
+            .into())
+    }
+
+    /// Similar to [`Self::get_block_header`] above, but for a range of blocks. This method
+    /// includes a starting block height and an ending block height as parameters to retrieve basic
+    /// information about the range of blocks.
+    pub async fn get_block_headers_range(
+        &self,
+        range: RangeInclusive<u64>,
+    ) -> anyhow::Result<(Vec<BlockHeaderResponse>, bool)> {
+        #[derive(Deserialize)]
+        struct Rsp {
+            headers: Vec<BlockHeaderResponseR>,
+            untrusted: bool,
+        }
+
+        let params = empty()
+            .chain(once(("start_height", (*range.start()).into())))
+            .chain(once(("end_height", (*range.end()).into())));
+
+        let Rsp { headers, untrusted } = self
+            .inner
+            .request::<MoneroResult<Rsp>>("get_block_headers_range", RpcParams::map(params))
+            .await?
+            .into_inner();
+
+        Ok((headers.into_iter().map(From::from).collect(), untrusted))
+    }
+
+    /// Enable additional functions for daemons in regtest mode.
+    pub fn regtest(self) -> RegtestDaemonJsonRpcClient {
+        RegtestDaemonJsonRpcClient(self)
+    }
+}
+
+/// Result of [`RpcClient::daemon_rpc`] to interact with methods on daemon called with their own
+/// extensions.
+///
+/// Not all daemon RPC calls use the `JSON_RPC` interface. The data structure for these calls is
+/// different. Whereas the JSON RPC methods were called using the `/json_rpc` extension and
+/// specifying a method, these methods are called at their own extensions.
+///
+/// ```rust
+/// # fn main() -> anyhow::Result<()> {
+/// use monero_rpc::RpcClientBuilder;
+///
+/// let client = RpcClientBuilder::new()
+///     .build("http://node.monerooutreach.org:18081")?;
+/// let daemon = client.daemon_rpc();
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Debug)]
+pub struct DaemonRpcClient {
+    inner: CallerWrapper,
+}
+
+impl DaemonRpcClient {
+    /// Look up one or more transactions by hash.
+    pub async fn get_transactions(
+        &self,
+        txs_hashes: Vec<CryptoNoteHash>,
+        decode_as_json: Option<bool>,
+        prune: Option<bool>,
+    ) -> anyhow::Result<TransactionsResponse> {
+        let params = empty()
+            .chain(once((
+                "txs_hashes",
+                txs_hashes
+                    .into_iter()
+                    .map(|s| HashString(s).to_string())
+                    .collect::<Vec<_>>()
+                    .into(),
+            )))
+            .chain(decode_as_json.map(|v| ("decode_as_json", v.into())))
+            .chain(prune.map(|v| ("prune", v.into())));
+        self.inner
+            .daemon_rpc_request::<TransactionsResponse>("get_transactions", RpcParams::map(params))
+            .await
+    }
+}
+
+impl RegtestDaemonJsonRpcClient {
+    /// Generate blocks and give mining rewards to specified address.
+    pub async fn generate_blocks(
+        &self,
+        amount_of_blocks: u64,
+        wallet_address: Address,
+    ) -> anyhow::Result<GenerateBlocksResponse> {
+        let params = empty()
+            .chain(once((
+                "amount_of_blocks",
+                serde_json::to_value(amount_of_blocks).unwrap(),
+            )))
+            .chain(once((
+                "wallet_address",
+                serde_json::to_value(wallet_address).unwrap(),
+            )));
+
+        Ok(self
+            .inner
+            .request::<MoneroResult<GenerateBlocksResponseR>>(
+                "generateblocks",
+                RpcParams::map(params),
+            )
+            .await?
+            .into_inner()
+            .into())
+    }
+}
+
+impl Serialize for TransferType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(match self {
+            TransferType::All => "all",
+            TransferType::Available => "available",
+            TransferType::Unavailable => "unavailable",
+        })
+    }
+}
+
+impl Serialize for TransferPriority {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u8(match self {
+            TransferPriority::Default => 0,
+            TransferPriority::Unimportant => 1,
+            TransferPriority::Elevated => 2,
+            TransferPriority::Priority => 3,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for TransferPriority {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let v = u8::deserialize(deserializer)?;
+        Ok(match v {
+            0 => TransferPriority::Default,
+            1 => TransferPriority::Unimportant,
+            2 => TransferPriority::Elevated,
+            3 => TransferPriority::Priority,
+            other => {
+                return Err(serde::de::Error::custom(format!(
+                    "Invalid variant {}, expected 0-3",
+                    other
+                )))
+            }
+        })
+    }
+}
+
+/// Result of [`RpcClient::wallet`] to interact with a Monero wallet RPC daemon.
+///
+/// ```rust
+/// # fn main() -> anyhow::Result<()> {
+/// use monero_rpc::RpcClientBuilder;
+///
+/// let client = RpcClientBuilder::new()
+///     .build("http://127.0.0.1:18083")?;
+/// let daemon = client.wallet();
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Debug)]
+pub struct WalletClient {
+    inner: CallerWrapper,
+}
+
+impl WalletClient {
+    /// Generate a new wallet from viewkey, address and optionally a spend key.  Requires the rpc
+    /// wallet to run with the `--wallet-dir` argument.
+    pub async fn generate_from_keys(
+        &self,
+        args: GenerateFromKeysArgs,
+    ) -> anyhow::Result<WalletCreation> {
+        let params = empty()
+            .chain(args.restore_height.map(|v| ("restore_height", v.into())))
+            .chain(once(("filename", args.filename.into())))
+            .chain(once(("address", args.address.to_string().into())))
+            .chain(args.spendkey.map(|v| ("spendkey", v.to_string().into())))
+            .chain(once(("viewkey", args.viewkey.to_string().into())))
+            .chain(once(("password", args.password.into())))
+            .chain(
+                args.autosave_current
+                    .map(|v| ("autosave_current", v.into())),
+            );
+        self.inner
+            .request("generate_from_keys", RpcParams::map(params))
+            .await
+    }
+
+    /// Create a new wallet. You need to have set the argument `--wallet-dir` when launching
+    /// monero-wallet-rpc to make this work.
+    pub async fn create_wallet(
+        &self,
+        filename: String,
+        password: Option<String>,
+        language: String,
+    ) -> anyhow::Result<()> {
+        let params = empty()
+            .chain(once(("filename", filename.into())))
+            .chain(password.map(|v| ("password", v.into())))
+            .chain(once(("language", language.into())));
+        self.inner
+            .request::<IgnoredAny>("create_wallet", RpcParams::map(params))
+            .await?;
+        Ok(())
+    }
+
+    /// Open a wallet. You need to have set the argument `--wallet-dir` when launching
+    /// monero-wallet-rpc to make this work.
+    pub async fn open_wallet(
+        &self,
+        filename: String,
+        password: Option<String>,
+    ) -> anyhow::Result<()> {
+        let params = empty()
+            .chain(once(("filename", filename.into())))
+            .chain(password.map(|v| ("password", v.into())));
+
+        self.inner
+            .request::<IgnoredAny>("open_wallet", RpcParams::map(params))
+            .await?;
+        Ok(())
+    }
+
+    /// Close the currently opened wallet, after trying to save it.
+    pub async fn close_wallet(&self) -> anyhow::Result<()> {
+        let params = empty();
+        self.inner
+            .request::<IgnoredAny>("close_wallet", RpcParams::map(params))
+            .await?;
+        Ok(())
+    }
+
+    /// Return the wallet's balance.
+    pub async fn get_balance(
+        &self,
+        account_index: u32,
+        address_indices: Option<Vec<u32>>,
+    ) -> anyhow::Result<BalanceData> {
+        let params = empty()
+            .chain(once(("account_index", account_index.into())))
+            .chain(address_indices.map(|v| {
+                (
+                    "address_indices",
+                    v.into_iter().map(Value::from).collect::<Vec<_>>().into(),
+                )
+            }));
+
+        self.inner
+            .request("get_balance", RpcParams::map(params))
+            .await
+    }
+
+    /// Return the wallet's addresses for an account. Optionally filter for specific set of
+    /// subaddresses.
+    pub async fn get_address(
+        &self,
+        account: u32,
+        addresses: Option<Vec<u32>>,
+    ) -> anyhow::Result<AddressData> {
+        let params = empty()
+            .chain(once(("account_index", account.into())))
+            .chain(addresses.map(|v| {
+                (
+                    "address_index",
+                    v.into_iter().map(Value::from).collect::<Vec<_>>().into(),
+                )
+            }));
+
+        self.inner
+            .request("get_address", RpcParams::map(params))
+            .await
+    }
+
+    /// Get account and address indexes from a specific (sub)address.
+    pub async fn get_address_index(&self, address: Address) -> anyhow::Result<subaddress::Index> {
+        #[derive(Deserialize)]
+        struct Rsp {
+            index: subaddress::Index,
+        }
+
+        let params = once(("address", address.to_string().into()));
+
+        let rsp = self
+            .inner
+            .request::<Rsp>("get_address_index", RpcParams::map(params))
+            .await?;
+
+        Ok(subaddress::Index {
+            major: rsp.index.major,
+            minor: rsp.index.minor,
         })
     }
 
-    /// Parses amounts with denomination suffix like they are produced with
-    /// `to_string_with_denomination` or with [`fmt::Display`].
-    ///
-    /// If you want to parse only the amount without the denomination, use `from_str_in`.
-    pub fn from_str_with_denomination(s: &str) -> Result<SignedAmount, ParsingError> {
-        let mut split = s.splitn(3, ' ');
-        let amt_str = split.next().unwrap();
-        let denom_str = split.next().ok_or(ParsingError::InvalidFormat)?;
-        if split.next().is_some() {
-            return Err(ParsingError::InvalidFormat);
+    /// Create a new address for an account. Optionally, label the new address.
+    pub async fn create_address(
+        &self,
+        account_index: u32,
+        label: Option<String>,
+    ) -> anyhow::Result<(Address, u32)> {
+        #[derive(Deserialize)]
+        struct Rsp {
+            address: Address,
+            address_index: u32,
         }
 
-        SignedAmount::from_str_in(amt_str, denom_str.parse()?)
+        let params = empty()
+            .chain(once(("account_index", Value::Number(account_index.into()))))
+            .chain(label.map(|v| ("label", Value::String(v))));
+
+        let rsp = self
+            .inner
+            .request::<Rsp>("create_address", RpcParams::map(params))
+            .await?;
+
+        Ok((rsp.address, rsp.address_index))
     }
 
-    /// Express this [`SignedAmount`] as a floating-point value in the given denomination.
-    ///
-    /// Please be aware of the risk of using floating-point numbers.
-    pub fn to_float_in(self, denom: Denomination) -> f64 {
-        f64::from_str(&self.to_string_in(denom)).unwrap()
+    /// Label an address.
+    pub async fn label_address(
+        &self,
+        index: subaddress::Index,
+        label: String,
+    ) -> anyhow::Result<()> {
+        let params = empty()
+            .chain(once(("index", json!(index))))
+            .chain(once(("label", label.into())));
+
+        self.inner
+            .request::<IgnoredAny>("label_address", RpcParams::map(params))
+            .await?;
+
+        Ok(())
     }
 
-    /// Express this [`SignedAmount`] as a floating-point value in Monero.
-    ///
-    /// Equivalent to `to_float_in(Denomination::Monero)`.
-    ///
-    /// Please be aware of the risk of using floating-point numbers.
-    pub fn as_xmr(self) -> f64 {
-        self.to_float_in(Denomination::Monero)
+    /// Refresh a wallet after openning.
+    pub async fn refresh(&self, start_height: Option<u64>) -> anyhow::Result<RefreshData> {
+        let params = empty().chain(start_height.map(|v| ("start_height", v.into())));
+
+        self.inner.request("refresh", RpcParams::map(params)).await
     }
 
-    /// Convert this [`SignedAmount`] in floating-point notation with a given denomination.
-    /// Can return error if the amount is too big, too precise or negative.
-    ///
-    /// Please be aware of the risk of using floating-point numbers.
-    pub fn from_float_in(value: f64, denom: Denomination) -> Result<SignedAmount, ParsingError> {
-        // This is inefficient, but the safest way to deal with this. The parsing logic is safe.
-        // Any performance-critical application should not be dealing with floats.
-        SignedAmount::from_str_in(&value.to_string(), denom)
+    /// Get all accounts for a wallet. Optionally filter accounts by tag.
+    pub async fn get_accounts(&self, tag: Option<String>) -> anyhow::Result<GetAccountsData> {
+        let params = empty().chain(tag.map(|v| ("tag", v.into())));
+
+        self.inner
+            .request("get_accounts", RpcParams::map(params))
+            .await
     }
 
-    /// Format the value of this [`SignedAmount`] in the given denomination.
-    ///
-    /// Does not include the denomination.
-    pub fn fmt_value_in(self, f: &mut dyn fmt::Write, denom: Denomination) -> fmt::Result {
-        let picos = self
-            .as_pico()
-            .checked_abs()
-            .map(|a: i64| a as u64)
-            .unwrap_or_else(|| {
-                // We could also hard code this into `9223372036854775808`
-                u64::max_value() - self.as_pico() as u64 + 1
-            });
-        fmt_piconero_in(picos, self.is_negative(), f, denom)
-    }
-
-    /// Get a string number of this [`SignedAmount`] in the given denomination.
-    ///
-    /// Does not include the denomination.
-    pub fn to_string_in(self, denom: Denomination) -> String {
-        let mut buf = String::new();
-        self.fmt_value_in(&mut buf, denom).unwrap();
-        buf
-    }
-
-    /// Get a formatted string of this [`SignedAmount`] in the given denomination, suffixed with
-    /// the abbreviation for the denomination.
-    pub fn to_string_with_denomination(self, denom: Denomination) -> String {
-        let mut buf = String::new();
-        self.fmt_value_in(&mut buf, denom).unwrap();
-        write!(buf, " {}", denom).unwrap();
-        buf
-    }
-
-    // Some arithmetic that doesn't fit in `std::ops` traits.
-
-    /// Get the absolute value of this [`SignedAmount`].
-    pub fn abs(self) -> SignedAmount {
-        SignedAmount(self.0.abs())
-    }
-
-    /// Returns a number representing sign of this [`SignedAmount`].
-    ///
-    /// - `0` if the amount is zero
-    /// - `1` if the amount is positive
-    /// - `-1` if the amount is negative
-    pub fn signum(self) -> i64 {
-        self.0.signum()
-    }
-
-    /// Returns `true` if this [`SignedAmount`] is positive and `false` if this [`SignedAmount`] is
-    /// zero or negative.
-    pub fn is_positive(self) -> bool {
-        self.0.is_positive()
-    }
-
-    /// Returns `true` if this [`SignedAmount`] is negative and `false` if this [`SignedAmount`] is
-    /// zero or positive.
-    pub fn is_negative(self) -> bool {
-        self.0.is_negative()
-    }
-
-    /// Get the absolute value of this [`SignedAmount`].  Returns [`None`] if overflow occurred.
-    /// (`self == min_value()`)
-    pub fn checked_abs(self) -> Option<SignedAmount> {
-        self.0.checked_abs().map(SignedAmount)
-    }
-
-    /// Checked addition.
-    /// Returns [`None`] if overflow occurred.
-    pub fn checked_add(self, rhs: SignedAmount) -> Option<SignedAmount> {
-        self.0.checked_add(rhs.0).map(SignedAmount)
-    }
-
-    /// Checked subtraction.
-    /// Returns [`None`] if overflow occurred.
-    pub fn checked_sub(self, rhs: SignedAmount) -> Option<SignedAmount> {
-        self.0.checked_sub(rhs.0).map(SignedAmount)
-    }
-
-    /// Checked multiplication.
-    /// Returns [`None`] if overflow occurred.
-    pub fn checked_mul(self, rhs: i64) -> Option<SignedAmount> {
-        self.0.checked_mul(rhs).map(SignedAmount)
-    }
-
-    /// Checked integer division.
-    /// Be aware that integer division loses the remainder if no exact division
-    /// can be made.
-    /// Returns [`None`] if overflow occurred.
-    pub fn checked_div(self, rhs: i64) -> Option<SignedAmount> {
-        self.0.checked_div(rhs).map(SignedAmount)
-    }
-
-    /// Checked remainder.
-    /// Returns [`None`] if overflow occurred.
-    pub fn checked_rem(self, rhs: i64) -> Option<SignedAmount> {
-        self.0.checked_rem(rhs).map(SignedAmount)
-    }
-
-    /// Subtraction that doesn't allow negative [`SignedAmount`]s.
-    /// Returns [`None`] if either `self`, `rhs` or the result is strictly negative.
-    pub fn positive_sub(self, rhs: SignedAmount) -> Option<SignedAmount> {
-        if self.is_negative() || rhs.is_negative() || rhs > self {
-            None
-        } else {
-            self.checked_sub(rhs)
-        }
-    }
-
-    /// Convert to an unsigned amount.
-    pub fn to_unsigned(self) -> Result<Amount, ParsingError> {
-        if self.is_negative() {
-            Err(ParsingError::Negative)
-        } else {
-            Ok(Amount::from_pico(self.as_pico() as u64))
-        }
-    }
-}
-
-impl default::Default for SignedAmount {
-    fn default() -> Self {
-        SignedAmount::ZERO
-    }
-}
-
-impl fmt::Debug for SignedAmount {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "SignedAmount({:.12} xmr)", self.as_xmr())
-    }
-}
-
-// No one should depend on a binding contract for Display for this type.
-// Just using Monero denominated string.
-impl fmt::Display for SignedAmount {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        self.fmt_value_in(f, Denomination::Monero)?;
-        write!(f, " {}", Denomination::Monero)
-    }
-}
-
-impl ops::Add for SignedAmount {
-    type Output = SignedAmount;
-
-    fn add(self, rhs: SignedAmount) -> Self::Output {
-        self.checked_add(rhs).expect("SignedAmount addition error")
-    }
-}
-
-impl ops::AddAssign for SignedAmount {
-    fn add_assign(&mut self, other: SignedAmount) {
-        *self = *self + other
-    }
-}
-
-impl ops::Sub for SignedAmount {
-    type Output = SignedAmount;
-
-    fn sub(self, rhs: SignedAmount) -> Self::Output {
-        self.checked_sub(rhs)
-            .expect("SignedAmount subtraction error")
-    }
-}
-
-impl ops::SubAssign for SignedAmount {
-    fn sub_assign(&mut self, other: SignedAmount) {
-        *self = *self - other
-    }
-}
-
-impl ops::Rem<i64> for SignedAmount {
-    type Output = SignedAmount;
-
-    fn rem(self, modulus: i64) -> Self {
-        self.checked_rem(modulus)
-            .expect("SignedAmount remainder error")
-    }
-}
-
-impl ops::RemAssign<i64> for SignedAmount {
-    fn rem_assign(&mut self, modulus: i64) {
-        *self = *self % modulus
-    }
-}
-
-impl ops::Mul<i64> for SignedAmount {
-    type Output = SignedAmount;
-
-    fn mul(self, rhs: i64) -> Self::Output {
-        self.checked_mul(rhs)
-            .expect("SignedAmount multiplication error")
-    }
-}
-
-impl ops::MulAssign<i64> for SignedAmount {
-    fn mul_assign(&mut self, rhs: i64) {
-        *self = *self * rhs
-    }
-}
-
-impl ops::Div<i64> for SignedAmount {
-    type Output = SignedAmount;
-
-    fn div(self, rhs: i64) -> Self::Output {
-        self.checked_div(rhs).expect("SignedAmount division error")
-    }
-}
-
-impl ops::DivAssign<i64> for SignedAmount {
-    fn div_assign(&mut self, rhs: i64) {
-        *self = *self / rhs
-    }
-}
-
-impl FromStr for SignedAmount {
-    type Err = ParsingError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        SignedAmount::from_str_with_denomination(s)
-    }
-}
-
-#[cfg(feature = "serde")]
-#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
-pub mod serde {
-    //! This module adds serde serialization and deserialization support for Amounts.
-    //! Since there is not a default way to serialize and deserialize Amounts, multiple
-    //! ways are supported and it's up to the user to decide which serialiation to use.
-    //! The provided modules can be used as follows:
-    //!
-    //! ```rust
-    //! use serde_crate::{Serialize, Deserialize};
-    //! use monero::Amount;
-    //!
-    //! #[derive(Serialize, Deserialize)]
-    //! # #[serde(crate = "serde_crate")]
-    //! pub struct HasAmount {
-    //!     #[serde(with = "monero::util::amount::serde::as_xmr")]
-    //!     pub amount: Amount,
-    //! }
-    //! ```
-    //!
-    //! Notabene that due to the limits of floating point precission, ::as_xmr
-    //! serializes amounts as strings.
-
-    use super::{Amount, Denomination, SignedAmount};
-    use sealed::sealed;
-    use serde_crate::{ser::SerializeSeq, Deserialize, Deserializer, Serialize, Serializer};
-
-    #[sealed]
-    /// This trait is used only to avoid code duplication and naming collisions of the different
-    /// serde serialization crates.
-    pub trait SerdeAmount: Copy + Sized {
-        /// Serialize with [`Serializer`] the amount as piconero.
-        fn ser_pico<S: Serializer>(self, s: S) -> Result<S::Ok, S::Error>;
-        /// Deserialize with [`Deserializer`] an amount in piconero.
-        fn des_pico<'d, D: Deserializer<'d>>(d: D) -> Result<Self, D::Error>;
-        /// Serialize with [`Serializer`] the amount as monero.
-        fn ser_xmr<S: Serializer>(self, s: S) -> Result<S::Ok, S::Error>;
-        /// Deserialize with [`Deserializer`] an amount in monero.
-        fn des_xmr<'d, D: Deserializer<'d>>(d: D) -> Result<Self, D::Error>;
-    }
-
-    #[sealed]
-    /// This trait is only for internal Amount type serialization/deserialization.
-    pub trait SerdeAmountForOpt: Copy + Sized + SerdeAmount {
-        /// Return the type prefix (`i` or `u`) used to sign or not the amount.
-        fn type_prefix() -> &'static str;
-        /// Serialize with [`Serializer`] an optional amount as piconero.
-        fn ser_pico_opt<S: Serializer>(self, s: S) -> Result<S::Ok, S::Error>;
-        /// Serialize with [`Serializer`] an optional amount as monero.
-        fn ser_xmr_opt<S: Serializer>(self, s: S) -> Result<S::Ok, S::Error>;
-    }
-
-    #[sealed]
-    /// This trait is for serialization of `&[Amount]` and `&[SignedAmount]` slices
-    pub trait SerdeAmountForSlice: Copy + Sized + SerdeAmount {
-        /// Return the type prefix (`i` or `u`) used to sign or not the amount.
-        fn type_prefix() -> &'static str;
-        /// Serialize with [`Serializer`] a slice of amounts as a slice of piconeros.
-        fn ser_pico_slice<S: SerializeSeq>(&self, s: &mut S) -> Result<(), S::Error>;
-        /// Serialize with [`Serializer`] a slice of amounts as a slice of moneros.
-        fn ser_xmr_slice<S: SerializeSeq>(&self, s: &mut S) -> Result<(), S::Error>;
-    }
-
-    #[sealed]
-    impl SerdeAmount for Amount {
-        fn ser_pico<S: Serializer>(self, s: S) -> Result<S::Ok, S::Error> {
-            u64::serialize(&self.as_pico(), s)
-        }
-        fn des_pico<'d, D: Deserializer<'d>>(d: D) -> Result<Self, D::Error> {
-            Ok(Amount::from_pico(u64::deserialize(d)?))
-        }
-        fn ser_xmr<S: Serializer>(self, s: S) -> Result<S::Ok, S::Error> {
-            String::serialize(&self.to_string_in(Denomination::Monero), s)
-        }
-        fn des_xmr<'d, D: Deserializer<'d>>(d: D) -> Result<Self, D::Error> {
-            use serde_crate::de::Error;
-            Amount::from_str_in(&String::deserialize(d)?, Denomination::Monero)
-                .map_err(D::Error::custom)
-        }
-    }
-
-    #[sealed]
-    impl SerdeAmountForOpt for Amount {
-        fn type_prefix() -> &'static str {
-            "u"
-        }
-        fn ser_pico_opt<S: Serializer>(self, s: S) -> Result<S::Ok, S::Error> {
-            s.serialize_some(&self.as_pico())
-        }
-        fn ser_xmr_opt<S: Serializer>(self, s: S) -> Result<S::Ok, S::Error> {
-            s.serialize_some(&self.to_string_in(Denomination::Monero))
-        }
-    }
-
-    #[sealed]
-    impl SerdeAmountForSlice for Amount {
-        fn type_prefix() -> &'static str {
-            "u"
+    /// Get a list of incoming payments using a given payment id.
+    pub async fn get_payments(&self, payment_id: PaymentId) -> anyhow::Result<Vec<Payment>> {
+        #[derive(Deserialize)]
+        struct Rsp {
+            #[serde(default)]
+            payments: Vec<Payment>,
         }
 
-        fn ser_pico_slice<S: SerializeSeq>(&self, s: &mut S) -> Result<(), S::Error> {
-            s.serialize_element(&self.as_pico())
-        }
+        let params = empty().chain(once((
+            "payment_id",
+            HashString(payment_id).to_string().into(),
+        )));
 
-        fn ser_xmr_slice<S: SerializeSeq>(&self, s: &mut S) -> Result<(), S::Error> {
-            s.serialize_element(&self.to_string_in(Denomination::Monero))
-        }
+        self.inner
+            .request::<Rsp>("get_payments", RpcParams::map(params))
+            .await
+            .map(|rsp| rsp.payments)
     }
 
-    #[sealed]
-    impl SerdeAmount for SignedAmount {
-        fn ser_pico<S: Serializer>(self, s: S) -> Result<S::Ok, S::Error> {
-            i64::serialize(&self.as_pico(), s)
+    /// Get a list of incoming payments using a given payment id, or a list of payments ids, from a
+    /// given height. This method is the preferred method over [`Self::get_payments`] because it
+    /// has the same functionality but is more extendable. Either is fine for looking up
+    /// transactions by a single payment ID.
+    pub async fn get_bulk_payments(
+        &self,
+        payment_ids: Vec<PaymentId>,
+        // It seems that the `min_block_height` argument is really optional, but the docs on the Monero website do not mention it
+        min_block_height: u64,
+    ) -> anyhow::Result<Vec<Payment>> {
+        #[derive(Deserialize)]
+        struct Rsp {
+            #[serde(default)]
+            payments: Vec<Payment>,
         }
-        fn des_pico<'d, D: Deserializer<'d>>(d: D) -> Result<Self, D::Error> {
-            Ok(SignedAmount::from_pico(i64::deserialize(d)?))
-        }
-        fn ser_xmr<S: Serializer>(self, s: S) -> Result<S::Ok, S::Error> {
-            String::serialize(&self.to_string_in(Denomination::Monero), s)
-        }
-        fn des_xmr<'d, D: Deserializer<'d>>(d: D) -> Result<Self, D::Error> {
-            use serde_crate::de::Error;
-            SignedAmount::from_str_in(&String::deserialize(d)?, Denomination::Monero)
-                .map_err(D::Error::custom)
-        }
+
+        let params = empty()
+            .chain(once((
+                "payment_ids",
+                payment_ids
+                    .into_iter()
+                    .map(|s| HashString(s).to_string())
+                    .collect::<Vec<_>>()
+                    .into(),
+            )))
+            .chain(once(("min_block_height", min_block_height.into())));
+
+        self.inner
+            .request::<Rsp>("get_bulk_payments", RpcParams::map(params))
+            .await
+            .map(|rsp| rsp.payments)
     }
 
-    #[sealed]
-    impl SerdeAmountForOpt for SignedAmount {
-        fn type_prefix() -> &'static str {
-            "i"
+    /// Return the spend or view private key.
+    pub async fn query_key(
+        &self,
+        key_selector: PrivateKeyType,
+    ) -> anyhow::Result<monero::PrivateKey> {
+        #[derive(Deserialize)]
+        struct Rsp {
+            key: HashString<Vec<u8>>,
         }
-        fn ser_pico_opt<S: Serializer>(self, s: S) -> Result<S::Ok, S::Error> {
-            s.serialize_some(&self.as_pico())
-        }
-        fn ser_xmr_opt<S: Serializer>(self, s: S) -> Result<S::Ok, S::Error> {
-            s.serialize_some(&self.to_string_in(Denomination::Monero))
-        }
+
+        let params = empty().chain({
+            match key_selector {
+                PrivateKeyType::View => empty().chain(once(("key_type", "view_key".into()))),
+                PrivateKeyType::Spend => empty().chain(once(("key_type", "spend_key".into()))),
+            }
+        });
+        let rsp = self
+            .inner
+            .request::<Rsp>("query_key", RpcParams::map(params))
+            .await?;
+
+        Ok(monero::PrivateKey::from_slice(&rsp.key.0)?)
     }
 
-    #[sealed]
-    impl SerdeAmountForSlice for SignedAmount {
-        fn type_prefix() -> &'static str {
-            "i"
+    /// Returns the wallet's current block height.
+    pub async fn get_height(&self) -> anyhow::Result<NonZeroU64> {
+        #[derive(Deserialize)]
+        struct Rsp {
+            height: NonZeroU64,
         }
 
-        fn ser_pico_slice<S: SerializeSeq>(&self, s: &mut S) -> Result<(), S::Error> {
-            s.serialize_element(&self.as_pico())
-        }
-
-        fn ser_xmr_slice<S: SerializeSeq>(&self, s: &mut S) -> Result<(), S::Error> {
-            s.serialize_element(&self.to_string_in(Denomination::Monero))
-        }
+        Ok(self
+            .inner
+            .request::<Rsp>("get_height", RpcParams::None)
+            .await?
+            .height)
     }
 
-    pub mod as_pico {
-        // methods are implementation of a standardized serde-specific signature
-        #![allow(missing_docs)]
+    /// Send all unlocked balance to an address.
+    pub async fn sweep_all(&self, args: SweepAllArgs) -> anyhow::Result<SweepAllData> {
+        let params = empty()
+            .chain(once(("address", args.address.to_string().into())))
+            .chain(once(("account_index", args.account_index.into())))
+            .chain(args.subaddr_indices.map(|v| ("subaddr_indices", v.into())))
+            .chain(once(("priority", serde_json::to_value(args.priority)?)))
+            .chain(once(("mixin", args.mixin.into())))
+            .chain(once(("ring_size", args.ring_size.into())))
+            .chain(once(("unlock_time", args.unlock_time.into())))
+            .chain(args.get_tx_keys.map(|v| ("get_tx_keys", v.into())))
+            .chain(
+                args.below_amount
+                    .map(|v| ("below_amount", v.as_pico().into())),
+            )
+            .chain(args.do_not_relay.map(|v| ("do_not_relay", v.into())))
+            .chain(args.get_tx_hex.map(|v| ("get_tx_hex", v.into())))
+            .chain(args.get_tx_metadata.map(|v| ("get_tx_metadata", v.into())));
+        self.inner
+            .request("sweep_all", RpcParams::map(params))
+            .await
+    }
 
-        //! Serialize and deserialize [`Amount`] as real numbers denominated in piconero.
-        //! Use with `#[serde(with = "amount::serde::as_pico")]`.
-        //!
-        //! [`Amount`]: crate::util::amount::Amount
-
-        use super::SerdeAmount;
-        use serde_crate::{Deserializer, Serializer};
-
-        pub fn serialize<A: SerdeAmount, S: Serializer>(a: &A, s: S) -> Result<S::Ok, S::Error> {
-            a.ser_pico(s)
+    /// Relay a transaction previously created with `"do_not_relay":true`.
+    pub async fn relay_tx(&self, tx_metadata_hex: String) -> anyhow::Result<CryptoNoteHash> {
+        #[derive(Deserialize)]
+        struct Rsp {
+            tx_hash: HashString<CryptoNoteHash>,
         }
-        pub fn deserialize<'d, A: SerdeAmount, D: Deserializer<'d>>(d: D) -> Result<A, D::Error> {
-            A::des_pico(d)
+        let params = empty().chain(once(("hex", tx_metadata_hex.into())));
+        Ok(self
+            .inner
+            .request::<Rsp>("relay_tx", RpcParams::map(params))
+            .await?
+            .tx_hash
+            .0)
+    }
+
+    /// Send monero to a number of recipients.
+    pub async fn transfer(
+        &self,
+        destinations: HashMap<Address, monero::Amount>,
+        priority: TransferPriority,
+        options: TransferOptions,
+    ) -> anyhow::Result<TransferData> {
+        let params = empty()
+            .chain(once((
+                "destinations",
+                destinations
+                    .into_iter()
+                    .map(
+                        |(address, amount)| json!({"address": address, "amount": amount.as_pico()}),
+                    )
+                    .collect::<Vec<Value>>()
+                    .into(),
+            )))
+            .chain(once(("priority", serde_json::to_value(priority)?)))
+            .chain(options.account_index.map(|v| ("account_index", v.into())))
+            .chain(options.subaddr_indices.map(|v| {
+                (
+                    "subaddr_indices",
+                    v.into_iter().map(From::from).collect::<Vec<Value>>().into(),
+                )
+            }))
+            .chain(options.mixin.map(|v| ("mixin", v.into())))
+            .chain(options.ring_size.map(|v| ("ring_size", v.into())))
+            .chain(options.unlock_time.map(|v| ("unlock_time", v.into())))
+            .chain(
+                options
+                    .payment_id
+                    .map(|v| ("payment_id", serde_json::to_value(HashString(v)).unwrap())),
+            )
+            .chain(options.do_not_relay.map(|v| ("do_not_relay", v.into())))
+            .chain(once(("get_tx_key", true.into())))
+            .chain(once(("get_tx_hex", true.into())))
+            .chain(once(("get_tx_metadata", true.into())));
+
+        self.inner.request("transfer", RpcParams::map(params)).await
+    }
+
+    /// Sign a transaction created on a read-only wallet (in cold-signing process).
+    pub async fn sign_transfer(
+        &self,
+        unsigned_txset: Vec<u8>,
+    ) -> anyhow::Result<SignedTransferOutput> {
+        #[derive(Deserialize)]
+        struct Rsp {
+            signed_txset: HashString<Vec<u8>>,
+            tx_hash_list: Vec<HashString<CryptoNoteHash>>,
+            tx_raw_list: Vec<HashString<Vec<u8>>>,
         }
 
-        pub mod opt {
-            //! Serialize and deserialize [Option] as a number denominated in piconero.
-            //! Use with `#[serde(default, with = "amount::serde::as_pico::opt")]`.
-
-            use super::super::SerdeAmountForOpt;
-            use core::fmt;
-            use core::marker::PhantomData;
-            use serde_crate::{de, Deserializer, Serializer};
-
-            pub fn serialize<A: SerdeAmountForOpt, S: Serializer>(
-                a: &Option<A>,
-                s: S,
-            ) -> Result<S::Ok, S::Error> {
-                match *a {
-                    Some(a) => a.ser_pico_opt(s),
-                    None => s.serialize_none(),
+        impl From<Rsp> for SignedTransferOutput {
+            fn from(value: Rsp) -> Self {
+                Self {
+                    signed_txset: value.signed_txset.0,
+                    tx_hash_list: value.tx_hash_list.into_iter().map(|v| v.0).collect(),
+                    tx_raw_list: value.tx_raw_list.into_iter().map(|v| v.0).collect(),
                 }
             }
+        }
 
-            pub fn deserialize<'d, A: SerdeAmountForOpt, D: Deserializer<'d>>(
-                d: D,
-            ) -> Result<Option<A>, D::Error> {
-                struct VisitOptAmt<X>(PhantomData<X>);
+        let params = empty()
+            .chain(once((
+                "unsigned_txset",
+                serde_json::to_value(HashString(unsigned_txset)).unwrap(),
+            )))
+            .chain(once(("export_raw", true.into())));
 
-                impl<'de, X: SerdeAmountForOpt> de::Visitor<'de> for VisitOptAmt<X> {
-                    type Value = Option<X>;
+        self.inner
+            .request::<Rsp>("sign_transfer", RpcParams::map(params))
+            .await
+            .map(From::from)
+    }
 
-                    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                        write!(formatter, "an Option<{}64>", X::type_prefix())
-                    }
+    /// Submit a previously signed transaction on a read-only wallet (in cold-signing process).
+    pub async fn submit_transfer(
+        &self,
+        tx_data_hex: Vec<u8>,
+    ) -> anyhow::Result<Vec<CryptoNoteHash>> {
+        #[derive(Deserialize)]
+        struct Rsp {
+            tx_hash_list: Vec<HashString<CryptoNoteHash>>,
+        }
 
-                    fn visit_none<E>(self) -> Result<Self::Value, E>
-                    where
-                        E: de::Error,
-                    {
-                        Ok(None)
-                    }
-                    fn visit_some<D>(self, d: D) -> Result<Self::Value, D::Error>
-                    where
-                        D: Deserializer<'de>,
-                    {
-                        Ok(Some(X::des_pico(d)?))
-                    }
+        let params = empty().chain(once((
+            "tx_data_hex",
+            HashString(tx_data_hex).to_string().into(),
+        )));
+
+        self.inner
+            .request::<Rsp>("submit_transfer", RpcParams::map(params))
+            .await
+            .map(|v| v.tx_hash_list.into_iter().map(|v| v.0).collect())
+    }
+
+    /// Return a list of incoming transfers to the wallet.
+    pub async fn incoming_transfers(
+        &self,
+        transfer_type: TransferType,
+        account_index: Option<u32>,
+        subaddr_indices: Option<Vec<u32>>,
+    ) -> anyhow::Result<IncomingTransfers> {
+        let params = empty()
+            .chain(once((
+                "transfer_type",
+                serde_json::to_value(transfer_type)?,
+            )))
+            .chain(account_index.map(|v| ("account_index", v.into())))
+            .chain(subaddr_indices.map(|v| ("subaddr_indices", v.into())));
+
+        self.inner
+            .request("incoming_transfers", RpcParams::map(params))
+            .await
+    }
+
+    /// Returns a list of transfers.
+    pub async fn get_transfers(
+        &self,
+        selector: GetTransfersSelector,
+    ) -> anyhow::Result<HashMap<GetTransfersCategory, Vec<GotTransfer>>> {
+        let GetTransfersSelector {
+            category_selector,
+            account_index,
+            subaddr_indices,
+            block_height_filter,
+        } = selector;
+
+        let mut min_height = None;
+        let mut max_height = None;
+
+        if let Some(block_filter) = block_height_filter.clone() {
+            min_height = match block_filter.min_height {
+                Some(x) => Some(x),
+                None => Some(0),
+            };
+            max_height = block_filter.max_height;
+        }
+
+        let params = empty()
+            .chain(
+                category_selector
+                    .into_iter()
+                    .map(|(cat, b)| (cat.into(), b.into())),
+            )
+            .chain(account_index.map(|v| ("account_index", v.into())))
+            .chain(subaddr_indices.map(|v| ("subaddr_indices", v.into())))
+            .chain(
+                block_height_filter
+                    .clone()
+                    .map(|_| ("filter_by_height", true.into())),
+            )
+            .chain(min_height.map(|b| ("min_height", b.into())))
+            .chain(max_height.map(|b| ("max_height", b.into())));
+
+        self.inner
+            .request("get_transfers", RpcParams::map(params))
+            .await
+    }
+
+    /// Show information about a transfer to/from this address. **Calls `get_transfer_by_txid` in
+    /// RPC.**
+    pub async fn get_transfer(
+        &self,
+        txid: CryptoNoteHash,
+        account_index: Option<u32>,
+    ) -> anyhow::Result<Option<GotTransfer>> {
+        #[derive(Deserialize)]
+        struct Rsp {
+            transfer: GotTransfer,
+        }
+
+        let params = empty()
+            .chain(Some(("txid", HashString(txid).to_string().into())))
+            .chain(account_index.map(|v| ("account_index", v.into())));
+
+        let rsp = match self
+            .inner
+            .0
+            .json_rpc_call("get_transfer_by_txid", RpcParams::map(params))
+            .await?
+        {
+            Ok(v) => serde_json::from_value::<Rsp>(v)?,
+            Err(e) => {
+                if e.code == jsonrpc_core::ErrorCode::ServerError(-8) {
+                    return Ok(None);
+                } else {
+                    return Err(e.into());
                 }
-                d.deserialize_option(VisitOptAmt::<A>(PhantomData))
+            }
+        };
+
+        Ok(Some(rsp.transfer))
+    }
+
+    pub async fn get_transfer_from_str(
+        &self,
+        txid: &str,
+        account_index: Option<u32>,
+    ) -> anyhow::Result<Option<GotTransfer>> {
+        #[derive(Deserialize)]
+        struct Rsp {
+            transfer: GotTransfer,
+        }
+
+        let params = empty()
+            .chain(Some(("txid", txid.into())))
+            .chain(account_index.map(|v| ("account_index", v.into())));
+
+        let rsp = match self
+            .inner
+            .0
+            .json_rpc_call("get_transfer_by_txid", RpcParams::map(params))
+            .await?
+        {
+            Ok(v) => serde_json::from_value::<Rsp>(v)?,
+            Err(e) => {
+                if e.code == jsonrpc_core::ErrorCode::ServerError(-8) {
+                    return Ok(None);
+                } else {
+                    return Err(e.into());
+                }
+            }
+        };
+
+        Ok(Some(rsp.transfer))
+    }
+
+    /// Export a signed set of key images.
+    pub async fn export_key_images(
+        &self,
+        all: Option<bool>,
+    ) -> anyhow::Result<Vec<SignedKeyImage>> {
+        #[derive(Deserialize)]
+        struct R {
+            key_image: HashString<Vec<u8>>,
+            signature: HashString<Vec<u8>>,
+        }
+
+        #[derive(Deserialize)]
+        struct Rsp {
+            #[serde(default)]
+            signed_key_images: Vec<R>,
+        }
+
+        impl From<Rsp> for Vec<SignedKeyImage> {
+            fn from(rsp: Rsp) -> Self {
+                rsp.signed_key_images
+                    .into_iter()
+                    .map(
+                        |R {
+                             key_image,
+                             signature,
+                         }| SignedKeyImage {
+                            key_image: key_image.0,
+                            signature: signature.0,
+                        },
+                    )
+                    .collect()
             }
         }
 
-        pub mod slice {
-            //! Serialize `&[Amount]` and `&[SignedAmount]` as an array of numbers denoted in piconero.
-            //! Use with `#[serde(default, serialize_with = "amount::serde::as_pico::slice::serialize")]`.
+        let params = empty().chain(all.map(|v| ("all", v.into())));
 
-            use super::super::SerdeAmountForSlice;
-            use serde_crate::{ser::SerializeSeq, Serializer};
-
-            pub fn serialize<A: SerdeAmountForSlice, S: Serializer>(
-                a_slice: &[A],
-                s: S,
-            ) -> Result<S::Ok, S::Error> {
-                let mut seq = s.serialize_seq(Some(a_slice.len()))?;
-
-                for e in a_slice {
-                    e.ser_pico_slice(&mut seq)?;
-                }
-
-                seq.end()
-            }
-        }
-
-        pub mod vec {
-            //! Deserialize an array of numbers (in piconero) into `Vec<Amount>` or
-            //! `Vec<SignedAmount>`.
-            //! It is possible to use `#[serde(default, deserialize_with = "amount::serde::as_pico::vec::deserialize_amount")]`
-            //! for `Vec<Amount>`, and `#[serde(default, deserialize_with = "amount::serde::as_pico::vec::deserialize_signed_amount")]`
-            //! for `Vec<SignedAmount>`.
-
-            use super::super::{Amount, SignedAmount};
-            use core::marker::PhantomData;
-            use serde_crate::{de, Deserializer};
-
-            /// Use with `#[serde(default, deserialize_with = "amount::serde::as_pico::vec::deserialize_amount")]`.
-            pub fn deserialize_amount<'d, D: Deserializer<'d>>(
-                d: D,
-            ) -> Result<Vec<Amount>, D::Error> {
-                struct VisitVecAmt(PhantomData<Amount>);
-
-                impl<'de> de::Visitor<'de> for VisitVecAmt {
-                    type Value = Vec<Amount>;
-
-                    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                        write!(formatter, "a Vec<u64>")
-                    }
-
-                    fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
-                    where
-                        S: de::SeqAccess<'de>,
-                    {
-                        std::iter::repeat_with(|| seq.next_element())
-                            .map_while(|e| e.transpose().map(|res| res.map(Amount::from_pico)))
-                            .collect()
-                    }
-                }
-
-                d.deserialize_seq(VisitVecAmt(PhantomData))
-            }
-
-            /// Use with `#[serde(default, deserialize_with = "amount::serde::as_pico::vec::deserialize_signed_amount")]`.
-            pub fn deserialize_signed_amount<'d, D: Deserializer<'d>>(
-                d: D,
-            ) -> Result<Vec<SignedAmount>, D::Error> {
-                struct VisitVecAmt(PhantomData<SignedAmount>);
-
-                impl<'de> de::Visitor<'de> for VisitVecAmt {
-                    type Value = Vec<SignedAmount>;
-
-                    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                        write!(formatter, "a Vec<i64>")
-                    }
-
-                    fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
-                    where
-                        S: de::SeqAccess<'de>,
-                    {
-                        std::iter::repeat_with(|| seq.next_element())
-                            .map_while(|e| {
-                                e.transpose().map(|res| res.map(SignedAmount::from_pico))
-                            })
-                            .collect()
-                    }
-                }
-
-                d.deserialize_seq(VisitVecAmt(PhantomData))
-            }
-        }
+        self.inner
+            .request::<Rsp>("export_key_images", RpcParams::map(params))
+            .await
+            .map(From::from)
     }
 
-    pub mod as_xmr {
-        // methods are implementation of a standardized serde-specific signature
-        #![allow(missing_docs)]
+    /// Import signed key images list and verify their spent status.
+    pub async fn import_key_images(
+        &self,
+        signed_key_images: Vec<SignedKeyImage>,
+    ) -> anyhow::Result<KeyImageImportResponse> {
+        let params = empty().chain(once((
+            "signed_key_images",
+            signed_key_images
+                .into_iter()
+                .map(
+                    |SignedKeyImage {
+                         key_image,
+                         signature,
+                     }| {
+                        json!({
+                            "key_image": HashString(key_image),
+                            "signature": HashString(signature),
+                        })
+                    },
+                )
+                .collect::<Vec<_>>()
+                .into(),
+        )));
 
-        //! Serialize and deserialize [`Amount`] as a string denominated in xmr.
-        //! Use with `#[serde(with = "amount::serde::as_xmr")]`.
-        //!
-        //! [`Amount`]: crate::util::amount::Amount
+        self.inner
+            .request("import_key_images", RpcParams::map(params))
+            .await
+    }
 
-        use super::SerdeAmount;
-        use serde_crate::{Deserializer, Serializer};
-
-        pub fn serialize<A: SerdeAmount, S: Serializer>(a: &A, s: S) -> Result<S::Ok, S::Error> {
-            a.ser_xmr(s)
+    /// Check a transaction in the blockchain with its secret key.
+    pub async fn check_tx_key(
+        &self,
+        txid: CryptoNoteHash,
+        tx_key: Vec<u8>,
+        address: Address,
+    ) -> anyhow::Result<(u64, bool, Amount)> {
+        #[derive(Deserialize)]
+        struct Rsp {
+            confirmations: u64,
+            in_pool: bool,
+            #[serde(with = "amount::serde::as_pico")]
+            received: Amount,
         }
 
-        pub fn deserialize<'d, A: SerdeAmount, D: Deserializer<'d>>(d: D) -> Result<A, D::Error> {
-            A::des_xmr(d)
+        let params = empty()
+            .chain(once(("txid", HashString(txid).to_string().into())))
+            .chain(once(("tx_key", HashString(tx_key).to_string().into())))
+            .chain(once(("address", address.to_string().into())));
+
+        let rsp = self
+            .inner
+            .request::<Rsp>("check_tx_key", RpcParams::map(params))
+            .await?;
+
+        Ok((rsp.confirmations, rsp.in_pool, rsp.received))
+    }
+
+    /// Get RPC version Major & Minor integer-format, where Major is the first 16 bits and Minor
+    /// the last 16 bits.
+    pub async fn get_version(&self) -> anyhow::Result<(u16, u16)> {
+        #[derive(Deserialize)]
+        struct Rsp {
+            version: u32,
         }
 
-        pub mod opt {
-            //! Serialize and deserialize [Option] as a number denominated in xmr.
-            //! Use with `#[serde(default, with = "amount::serde::as_xmr::opt")]`.
+        let version = self
+            .inner
+            .request::<Rsp>("get_version", RpcParams::None)
+            .await?;
 
-            use super::super::SerdeAmountForOpt;
-            use core::fmt;
-            use core::marker::PhantomData;
-            use serde_crate::{de, Deserializer, Serializer};
+        let major = version.version >> 16;
+        let minor = version.version - (major << 16);
 
-            pub fn serialize<A: SerdeAmountForOpt, S: Serializer>(
-                a: &Option<A>,
-                s: S,
-            ) -> Result<S::Ok, S::Error> {
-                match *a {
-                    Some(a) => a.ser_xmr_opt(s),
-                    None => s.serialize_none(),
-                }
-            }
-
-            pub fn deserialize<'d, A: SerdeAmountForOpt, D: Deserializer<'d>>(
-                d: D,
-            ) -> Result<Option<A>, D::Error> {
-                struct VisitOptAmt<X>(PhantomData<X>);
-
-                impl<'de, X: SerdeAmountForOpt> de::Visitor<'de> for VisitOptAmt<X> {
-                    type Value = Option<X>;
-
-                    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                        write!(formatter, "an Option<String>")
-                    }
-
-                    fn visit_none<E>(self) -> Result<Self::Value, E>
-                    where
-                        E: de::Error,
-                    {
-                        Ok(None)
-                    }
-                    fn visit_some<D>(self, d: D) -> Result<Self::Value, D::Error>
-                    where
-                        D: Deserializer<'de>,
-                    {
-                        Ok(Some(X::des_xmr(d)?))
-                    }
-                }
-                d.deserialize_option(VisitOptAmt::<A>(PhantomData))
-            }
-        }
-
-        pub mod slice {
-            //! Serialize `&[Amount]` and `&[SignedAmount]` as an array of numbers denoted in xmr.
-            //! Use with `#[serde(default, serialize_with = "amount::serde::as_xmr::slice::serialize")]`.
-
-            use super::super::SerdeAmountForSlice;
-            use serde_crate::{ser::SerializeSeq, Serializer};
-
-            pub fn serialize<A: SerdeAmountForSlice, S: Serializer>(
-                a_slice: &[A],
-                s: S,
-            ) -> Result<S::Ok, S::Error> {
-                let mut seq = s.serialize_seq(Some(a_slice.len()))?;
-
-                for e in a_slice {
-                    e.ser_xmr_slice(&mut seq)?;
-                }
-
-                seq.end()
-            }
-        }
-
-        pub mod vec {
-            //! Deserialize an array of numbers (in xmr) into `Vec<Amount>` or
-            //! `Vec<SignedAmount>`.
-            //! It is possible to use `#[serde(default, deserialize_with = "amount::serde::as_xmr::vec::deserialize_amount")]`
-            //! for `Vec<Amount>`, and `#[serde(default, deserialize_with = "amount::serde::as_xmr::vec::deserialize_signed_amount")]`
-            //! for `Vec<SignedAmount>`.
-
-            use super::super::{super::Denomination, Amount, SignedAmount};
-            use core::marker::PhantomData;
-            use serde_crate::{de, Deserializer};
-
-            /// Use with `#[serde(default, deserialize_with = "amount::serde::as_xmr::vec::deserialize_amount")]`.
-            pub fn deserialize_amount<'d, D: Deserializer<'d>>(
-                d: D,
-            ) -> Result<Vec<Amount>, D::Error> {
-                struct VisitVecAmt(PhantomData<Amount>);
-
-                impl<'de> de::Visitor<'de> for VisitVecAmt {
-                    type Value = Vec<Amount>;
-
-                    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                        write!(formatter, "a Vec<String>")
-                    }
-
-                    fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
-                    where
-                        S: de::SeqAccess<'de>,
-                    {
-                        std::iter::repeat_with(|| seq.next_element())
-                            .map_while(|e| {
-                                e.transpose().map(|res| {
-                                    res.and_then(|amt| {
-                                        Amount::from_str_in(amt, Denomination::Monero)
-                                            .map_err(|e| de::Error::custom(e.to_string()))
-                                    })
-                                })
-                            })
-                            .collect()
-                    }
-                }
-
-                d.deserialize_seq(VisitVecAmt(PhantomData))
-            }
-
-            /// Use with `#[serde(default, deserialize_with = "amount::serde::as_xmr::vec::deserialize_signed_amount")]`.
-            pub fn deserialize_signed_amount<'d, D: Deserializer<'d>>(
-                d: D,
-            ) -> Result<Vec<SignedAmount>, D::Error> {
-                struct VisitVecAmt(PhantomData<SignedAmount>);
-
-                impl<'de> de::Visitor<'de> for VisitVecAmt {
-                    type Value = Vec<SignedAmount>;
-
-                    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                        write!(formatter, "a Vec<String>")
-                    }
-
-                    fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
-                    where
-                        S: de::SeqAccess<'de>,
-                    {
-                        std::iter::repeat_with(|| seq.next_element())
-                            .map_while(|e| {
-                                e.transpose().map(|res| {
-                                    res.and_then(|amt| {
-                                        SignedAmount::from_str_in(amt, Denomination::Monero)
-                                            .map_err(|e| de::Error::custom(e.to_string()))
-                                    })
-                                })
-                            })
-                            .collect()
-                    }
-                }
-
-                d.deserialize_seq(VisitVecAmt(PhantomData))
-            }
-        }
+        Ok((u16::try_from(major)?, u16::try_from(minor)?))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::panic;
-    use std::str::FromStr;
-
-    #[cfg(feature = "serde")]
-    use serde_test;
+    use serde_test::{assert_de_tokens_error, assert_ser_tokens, assert_tokens, Token};
 
     #[test]
-    fn add_sub_mul_div() {
-        let pico = Amount::from_pico;
-        let spico = SignedAmount::from_pico;
+    fn rpc_params_array() {
+        let mut array = once(json!(false));
+        let rpc_params_array = RpcParams::array(array.clone());
 
-        assert_eq!(pico(15) + pico(15), pico(30));
-        assert_eq!(pico(15) - pico(15), pico(0));
-        assert_eq!(pico(14) * 3, pico(42));
-        assert_eq!(pico(14) / 2, pico(7));
-        assert_eq!(pico(14) % 3, pico(2));
-        assert_eq!(spico(15) - spico(20), spico(-5));
-        assert_eq!(spico(-14) * 3, spico(-42));
-        assert_eq!(spico(-14) / 2, spico(-7));
-        assert_eq!(spico(-14) % 3, spico(-2));
-
-        let mut b = spico(-5);
-        b += spico(13);
-        assert_eq!(b, spico(8));
-        b -= spico(3);
-        assert_eq!(b, spico(5));
-        b *= 6;
-        assert_eq!(b, spico(30));
-        b /= 3;
-        assert_eq!(b, spico(10));
-        b %= 3;
-        assert_eq!(b, spico(1));
-
-        // panic on overflow
-        let result = panic::catch_unwind(|| Amount::max_value() + Amount::from_pico(1));
-        assert!(result.is_err());
-        let result = panic::catch_unwind(|| Amount::from_pico(8446744073709551615) * 3);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn checked_arithmetic() {
-        let pico = Amount::from_pico;
-        let spico = SignedAmount::from_pico;
-
-        assert_eq!(pico(42).checked_add(pico(1)), Some(pico(43)));
-        assert_eq!(SignedAmount::max_value().checked_add(spico(1)), None);
-        assert_eq!(SignedAmount::min_value().checked_sub(spico(1)), None);
-        assert_eq!(Amount::max_value().checked_add(pico(1)), None);
-        assert_eq!(Amount::min_value().checked_sub(pico(1)), None);
-
-        assert_eq!(pico(5).checked_sub(pico(3)), Some(pico(2)));
-        assert_eq!(pico(5).checked_sub(pico(6)), None);
-        assert_eq!(spico(5).checked_sub(spico(6)), Some(spico(-1)));
-        assert_eq!(pico(5).checked_rem(2), Some(pico(1)));
-
-        assert_eq!(pico(5).checked_div(2), Some(pico(2))); // integer division
-        assert_eq!(spico(-6).checked_div(2), Some(spico(-3)));
-
-        assert_eq!(spico(-5).positive_sub(spico(3)), None);
-        assert_eq!(spico(5).positive_sub(spico(-3)), None);
-        assert_eq!(spico(3).positive_sub(spico(5)), None);
-        assert_eq!(spico(3).positive_sub(spico(3)), Some(spico(0)));
-        assert_eq!(spico(5).positive_sub(spico(3)), Some(spico(2)));
-    }
-
-    #[test]
-    #[allow(clippy::float_cmp)]
-    fn floating_point() {
-        use super::Denomination as D;
-        let f = Amount::from_float_in;
-        let sf = SignedAmount::from_float_in;
-        let pico = Amount::from_pico;
-        let spico = SignedAmount::from_pico;
-
-        assert_eq!(f(11.22, D::Monero), Ok(pico(11220000000000)));
-        assert_eq!(sf(-11.22, D::Millinero), Ok(spico(-11220000000)));
-        assert_eq!(f(11.22, D::Micronero), Ok(pico(11220000)));
-        assert_eq!(f(0.0001234, D::Monero), Ok(pico(123400000)));
-        assert_eq!(sf(-0.00012345, D::Monero), Ok(spico(-123450000)));
-
-        assert_eq!(f(-100.0, D::Piconero), Err(ParsingError::Negative));
-        assert_eq!(f(11.22, D::Piconero), Err(ParsingError::TooPrecise));
-        assert_eq!(sf(-0.1, D::Piconero), Err(ParsingError::TooPrecise));
-        assert_eq!(
-            f(42.000_000_000_000_1, D::Monero),
-            Err(ParsingError::TooPrecise)
-        );
-        assert_eq!(sf(-184467440738.0, D::Monero), Err(ParsingError::TooBig));
-        assert_eq!(
-            f(18446744073709551617.0, D::Piconero),
-            Err(ParsingError::TooBig)
-        );
-        assert_eq!(
-            f(
-                SignedAmount::max_value().to_float_in(D::Piconero) + 1.0,
-                D::Piconero
-            ),
-            Err(ParsingError::TooBig)
-        );
-        assert_eq!(
-            f(
-                Amount::max_value().to_float_in(D::Piconero) + 1.0,
-                D::Piconero
-            ),
-            Err(ParsingError::TooBig)
-        );
-
-        let xmr = move |f| SignedAmount::from_xmr(f).unwrap();
-        assert_eq!(xmr(2.5).to_float_in(D::Monero), 2.5);
-        assert_eq!(xmr(-2.5).to_float_in(D::Millinero), -2500.0);
-        assert_eq!(xmr(-2.5).to_float_in(D::Micronero), -2500000.0);
-        assert_eq!(xmr(-2.5).to_float_in(D::Nanonero), -2500000000.0);
-        assert_eq!(xmr(2.5).to_float_in(D::Piconero), 2500000000000.0);
-
-        let xmr = move |f| Amount::from_xmr(f).unwrap();
-        assert_eq!(&xmr(0.0012).to_float_in(D::Monero).to_string(), "0.0012")
-    }
-
-    #[test]
-    fn parsing() {
-        use super::ParsingError as E;
-        let xmr = Denomination::Monero;
-        let pico = Denomination::Piconero;
-        let p = Amount::from_str_in;
-        let sp = SignedAmount::from_str_in;
-
-        assert_eq!(p("x", xmr), Err(E::InvalidCharacter('x')));
-        assert_eq!(p("-", xmr), Err(E::InvalidFormat));
-        assert_eq!(sp("-", xmr), Err(E::InvalidFormat));
-        assert_eq!(p("-1.0x", xmr), Err(E::InvalidCharacter('x')));
-        assert_eq!(p("0.0 ", xmr), Err(ParsingError::InvalidCharacter(' ')));
-        assert_eq!(p("0.000.000", xmr), Err(E::InvalidFormat));
-        let more_than_max = format!("1{}", Amount::max_value());
-        assert_eq!(p(&more_than_max, xmr), Err(E::TooBig));
-        assert_eq!(p("0.0000000000042", xmr), Err(E::TooPrecise));
-
-        assert_eq!(p("1", xmr), Ok(Amount::from_pico(1_000_000_000_000)));
-        assert_eq!(
-            sp("-.5", xmr),
-            Ok(SignedAmount::from_pico(-500_000_000_000))
-        );
-        assert_eq!(p("1.1", xmr), Ok(Amount::from_pico(1_100_000_000_000)));
-        assert_eq!(p("100", pico), Ok(Amount::from_pico(100)));
-        assert_eq!(p("55", pico), Ok(Amount::from_pico(55)));
-        assert_eq!(
-            p("5500000000000000000", pico),
-            Ok(Amount::from_pico(5_500_000_000_000_000_000))
-        );
-        // Should this even pass?
-        assert_eq!(
-            p("5500000000000000000.", pico),
-            Ok(Amount::from_pico(5_500_000_000_000_000_000))
-        );
-        assert_eq!(
-            p("1234567.123456789123", xmr),
-            Ok(Amount::from_pico(1_234_567_123_456_789_123))
-        );
-
-        // make sure Piconero > i64::max_value() is checked.
-        let amount = Amount::from_pico(i64::max_value() as u64);
-        assert_eq!(
-            Amount::from_str_in(&amount.to_string_in(pico), pico),
-            Ok(amount)
-        );
-        assert_eq!(
-            Amount::from_str_in(&(amount + Amount(1)).to_string_in(pico), pico),
-            Err(E::TooBig)
-        );
-
-        // exactly 50 chars.
-        assert_eq!(
-            p(
-                "100000000000000.0000000000000000000000000000000000",
-                Denomination::Monero
-            ),
-            Err(E::TooBig)
-        );
-        // more than 50 chars.
-        assert_eq!(
-            p(
-                "100000000000000.00000000000000000000000000000000000",
-                Denomination::Monero
-            ),
-            Err(E::InputTooLarge)
-        );
-    }
-
-    #[test]
-    fn to_string() {
-        use super::Denomination as D;
-
-        assert_eq!(Amount::ONE_XMR.to_string_in(D::Monero), "1.000000000000");
-        assert_eq!(Amount::ONE_XMR.to_string_in(D::Piconero), "1000000000000");
-        assert_eq!(Amount::ONE_PICO.to_string_in(D::Monero), "0.000000000001");
-        assert_eq!(
-            SignedAmount::from_pico(-42).to_string_in(D::Monero),
-            "-0.000000000042"
-        );
-
-        assert_eq!(
-            Amount::ONE_XMR.to_string_with_denomination(D::Monero),
-            "1.000000000000 xmr"
-        );
-        assert_eq!(
-            SignedAmount::ONE_XMR.to_string_with_denomination(D::Piconero),
-            "1000000000000 piconero"
-        );
-        assert_eq!(
-            Amount::ONE_PICO.to_string_with_denomination(D::Monero),
-            "0.000000000001 xmr"
-        );
-        assert_eq!(
-            SignedAmount::from_pico(-42).to_string_with_denomination(D::Monero),
-            "-0.000000000042 xmr"
-        );
-    }
-
-    #[test]
-    fn test_unsigned_signed_conversion() {
-        use super::ParsingError as E;
-        let p = Amount::from_pico;
-        let sp = SignedAmount::from_pico;
-
-        assert_eq!(Amount::max_value().to_signed(), Err(E::TooBig));
-        assert_eq!(
-            p(i64::max_value() as u64).to_signed(),
-            Ok(sp(i64::max_value()))
-        );
-        assert_eq!(p(0).to_signed(), Ok(sp(0)));
-        assert_eq!(p(1).to_signed(), Ok(sp(1)));
-        assert_eq!(p(1).to_signed(), Ok(sp(1)));
-        assert_eq!(p(i64::max_value() as u64 + 1).to_signed(), Err(E::TooBig));
-
-        assert_eq!(sp(-1).to_unsigned(), Err(E::Negative));
-        assert_eq!(
-            sp(i64::max_value()).to_unsigned(),
-            Ok(p(i64::max_value() as u64))
-        );
-
-        assert_eq!(sp(0).to_unsigned().unwrap().to_signed(), Ok(sp(0)));
-        assert_eq!(sp(1).to_unsigned().unwrap().to_signed(), Ok(sp(1)));
-        assert_eq!(
-            sp(i64::max_value()).to_unsigned().unwrap().to_signed(),
-            Ok(sp(i64::max_value()))
-        );
-    }
-
-    #[test]
-    fn from_str() {
-        use super::ParsingError as E;
-        let p = Amount::from_str;
-        let sp = SignedAmount::from_str;
-
-        assert_eq!(p("x XMR"), Err(E::InvalidCharacter('x')));
-        assert_eq!(p("5 XMR XMR"), Err(E::InvalidFormat));
-        assert_eq!(p("5 5 XMR"), Err(E::InvalidFormat));
-
-        assert_eq!(p("5 BCH"), Err(E::UnknownDenomination("BCH".to_owned())));
-
-        assert_eq!(p("-1 XMR"), Err(E::Negative));
-        assert_eq!(p("-0.0 XMR"), Err(E::Negative));
-        assert_eq!(p("0.1234567891234 XMR"), Err(E::TooPrecise));
-        assert_eq!(sp("-0.1 piconero"), Err(E::TooPrecise));
-        assert_eq!(p("0.1234567 micronero"), Err(E::TooPrecise));
-        assert_eq!(sp("-1.0001 nanonero"), Err(E::TooPrecise));
-        assert_eq!(sp("-200000000000 XMR"), Err(E::TooBig));
-        assert_eq!(p("18446744073709551616 piconero"), Err(E::TooBig));
-
-        assert_eq!(p(".5 nanonero"), Ok(Amount::from_pico(500)));
-        assert_eq!(sp("-.5 nanonero"), Ok(SignedAmount::from_pico(-500)));
-        assert_eq!(p("0.000000253583 XMR"), Ok(Amount::from_pico(253583)));
-        assert_eq!(sp("-5 piconero"), Ok(SignedAmount::from_pico(-5)));
-        assert_eq!(
-            p("0.100000000000 XMR"),
-            Ok(Amount::from_pico(100_000_000_000))
-        );
-        assert_eq!(sp("-10 nanonero"), Ok(SignedAmount::from_pico(-10_000)));
-        assert_eq!(
-            sp("-10 micronero"),
-            Ok(SignedAmount::from_pico(-10_000_000))
-        );
-        assert_eq!(
-            sp("-10 millinero"),
-            Ok(SignedAmount::from_pico(-10_000_000_000))
-        );
-    }
-
-    #[test]
-    fn to_from_string_in() {
-        use super::Denomination as D;
-        let ua_str = Amount::from_str_in;
-        let ua_pic = Amount::from_pico;
-        let sa_str = SignedAmount::from_str_in;
-        let sa_pic = SignedAmount::from_pico;
-
-        assert_eq!("0.500", Amount::from_pico(500).to_string_in(D::Nanonero));
-        assert_eq!(
-            "-0.500",
-            SignedAmount::from_pico(-500).to_string_in(D::Nanonero)
-        );
-        assert_eq!(
-            "0.002535830000",
-            Amount::from_pico(2535830000).to_string_in(D::Monero)
-        );
-        assert_eq!("-5", SignedAmount::from_pico(-5).to_string_in(D::Piconero));
-        assert_eq!(
-            "0.100000000000",
-            Amount::from_pico(100_000_000_000).to_string_in(D::Monero)
-        );
-        assert_eq!(
-            "-10.000",
-            SignedAmount::from_pico(-10_000).to_string_in(D::Nanonero)
-        );
-
-        assert_eq!(
-            ua_str(&ua_pic(0).to_string_in(D::Piconero), D::Piconero),
-            Ok(ua_pic(0))
-        );
-        assert_eq!(
-            ua_str(&ua_pic(500).to_string_in(D::Monero), D::Monero),
-            Ok(ua_pic(500))
-        );
-        assert_eq!(
-            ua_str(&ua_pic(21_000_000).to_string_in(D::Nanonero), D::Nanonero),
-            Ok(ua_pic(21_000_000))
-        );
-        assert_eq!(
-            ua_str(&ua_pic(1).to_string_in(D::Micronero), D::Micronero),
-            Ok(ua_pic(1))
-        );
-        assert_eq!(
-            ua_str(
-                &ua_pic(1_000_000_000_000).to_string_in(D::Millinero),
-                D::Millinero
-            ),
-            Ok(ua_pic(1_000_000_000_000))
-        );
-        assert_eq!(
-            ua_str(
-                &ua_pic(u64::max_value()).to_string_in(D::Millinero),
-                D::Millinero
-            ),
-            Err(ParsingError::TooBig)
-        );
-
-        assert_eq!(
-            sa_str(&sa_pic(-1).to_string_in(D::Micronero), D::Micronero),
-            Ok(sa_pic(-1))
-        );
-
-        assert_eq!(
-            sa_str(
-                &sa_pic(i64::max_value()).to_string_in(D::Piconero),
-                D::Micronero
-            ),
-            Err(ParsingError::TooBig)
-        );
-        // Test an overflow bug in `abs()`
-        assert_eq!(
-            sa_str(
-                &sa_pic(i64::min_value()).to_string_in(D::Piconero),
-                D::Micronero
-            ),
-            Err(ParsingError::TooBig)
-        );
-    }
-
-    #[test]
-    fn to_string_with_denomination_from_str_roundtrip() {
-        use super::Denomination as D;
-        let amt = Amount::from_pico(42);
-        let denom = Amount::to_string_with_denomination;
-        assert_eq!(Amount::from_str(&denom(amt, D::Monero)), Ok(amt));
-        assert_eq!(Amount::from_str(&denom(amt, D::Millinero)), Ok(amt));
-        assert_eq!(Amount::from_str(&denom(amt, D::Micronero)), Ok(amt));
-        assert_eq!(Amount::from_str(&denom(amt, D::Nanonero)), Ok(amt));
-        assert_eq!(Amount::from_str(&denom(amt, D::Piconero)), Ok(amt));
-
-        assert_eq!(
-            Amount::from_str("42 piconero XMR"),
-            Err(ParsingError::InvalidFormat)
-        );
-        assert_eq!(
-            SignedAmount::from_str("-42 piconero XMR"),
-            Err(ParsingError::InvalidFormat)
-        );
-    }
-
-    #[cfg(feature = "serde")]
-    #[test]
-    fn serde_as_pico() {
-        use serde_crate::{Deserialize, Serialize};
-
-        #[derive(Serialize, Deserialize, PartialEq, Debug)]
-        #[serde(crate = "serde_crate")]
-        struct T {
-            #[serde(with = "super::serde::as_pico")]
-            pub amt: Amount,
-            #[serde(with = "super::serde::as_pico")]
-            pub samt: SignedAmount,
+        if let RpcParams::Array(mut rpc_boxed_array) = rpc_params_array {
+            assert_eq!(rpc_boxed_array.next(), array.next());
+            assert_eq!(rpc_boxed_array.next(), None);
+            assert_eq!(array.next(), None);
+        } else {
+            unreachable!();
         }
-        serde_test::assert_tokens(
-            &T {
-                amt: Amount::from_pico(123456789),
-                samt: SignedAmount::from_pico(-123456789),
-            },
+    }
+
+    #[test]
+    fn rpc_params_map() {
+        let map = once(("it is false", json!(false)));
+        let rpc_params_map = RpcParams::map(map.clone());
+
+        let mut map = map.map(|(k, v)| (k.to_string(), v));
+
+        if let RpcParams::Map(mut boxed_map) = rpc_params_map {
+            assert_eq!(boxed_map.next(), map.next());
+            assert_eq!(boxed_map.next(), None);
+            assert_eq!(map.next(), None);
+        } else {
+            unreachable!();
+        }
+    }
+
+    #[test]
+    fn from_rpc_params_for_params() {
+        let rpc_param_array = RpcParams::array(once(json!(false)));
+        let rpc_param_map = RpcParams::map(once(("it is false", json!(false))));
+        let rpc_param_none = RpcParams::None;
+
+        assert_eq!(Params::from(rpc_param_none), Params::None);
+        assert_eq!(
+            Params::from(rpc_param_array),
+            Params::Array(vec![json!(false)])
+        );
+
+        let mut serde_json_map = serde_json::map::Map::new();
+        serde_json_map.insert("it is false".to_string(), json!(false));
+
+        assert_eq!(Params::from(rpc_param_map), Params::Map(serde_json_map));
+    }
+
+    #[test]
+    fn serialize_transfer_type() {
+        let transfer_types = vec![
+            TransferType::All,
+            TransferType::Available,
+            TransferType::Unavailable,
+        ];
+        assert_ser_tokens(
+            &transfer_types,
             &[
-                serde_test::Token::Struct { name: "T", len: 2 },
-                serde_test::Token::Str("amt"),
-                serde_test::Token::U64(123456789),
-                serde_test::Token::Str("samt"),
-                serde_test::Token::I64(-123456789),
-                serde_test::Token::StructEnd,
+                Token::Seq { len: Some(3) },
+                Token::Str("all"),
+                Token::Str("available"),
+                Token::Str("unavailable"),
+                Token::SeqEnd,
             ],
         );
     }
 
-    #[cfg(feature = "serde")]
     #[test]
-    fn serde_as_pico_opt() {
-        use serde_crate::{Deserialize, Serialize};
-        use serde_json;
-
-        #[derive(Serialize, Deserialize, PartialEq, Debug, Eq)]
-        #[serde(crate = "serde_crate")]
-        struct T {
-            #[serde(default, with = "super::serde::as_pico::opt")]
-            pub amt: Option<Amount>,
-            #[serde(default, with = "super::serde::as_pico::opt")]
-            pub samt: Option<SignedAmount>,
-        }
-
-        let with = T {
-            amt: Some(Amount::from_pico(2_500_000_000_000)),
-            samt: Some(SignedAmount::from_pico(-2_500_000_000_000)),
-        };
-        let without = T {
-            amt: None,
-            samt: None,
-        };
-
-        // Test Roundtripping
-        for s in [&with, &without].iter() {
-            let v = serde_json::to_string(s).unwrap();
-            let w: T = serde_json::from_str(&v).unwrap();
-            assert_eq!(w, **s);
-        }
-
-        let t: T =
-            serde_json::from_str("{\"amt\": 2500000000000, \"samt\": -2500000000000}").unwrap();
-        assert_eq!(t, with);
-
-        let t: T = serde_json::from_str("{}").unwrap();
-        assert_eq!(t, without);
-
-        let value_with: serde_json::Value =
-            serde_json::from_str("{\"amt\": 2500000000000, \"samt\": -2500000000000}").unwrap();
-        assert_eq!(with, serde_json::from_value(value_with).unwrap());
-
-        let value_without: serde_json::Value = serde_json::from_str("{}").unwrap();
-        assert_eq!(without, serde_json::from_value(value_without).unwrap());
-    }
-
-    #[cfg(feature = "serde")]
-    #[test]
-    fn serde_as_pico_slice_serialize() {
-        use serde_crate::Serialize;
-
-        #[derive(Serialize, PartialEq, Debug, Eq)]
-        #[serde(crate = "serde_crate")]
-        struct T<'a> {
-            #[serde(default, serialize_with = "super::serde::as_pico::slice::serialize")]
-            pub amt1: Vec<Amount>,
-            #[serde(default, serialize_with = "super::serde::as_pico::slice::serialize")]
-            pub amt2: [Amount; 2],
-            #[serde(default, serialize_with = "super::serde::as_pico::slice::serialize")]
-            pub amt3: &'a [Amount],
-
-            #[serde(default, serialize_with = "super::serde::as_pico::slice::serialize")]
-            pub samt1: Vec<SignedAmount>,
-            #[serde(default, serialize_with = "super::serde::as_pico::slice::serialize")]
-            pub samt2: [SignedAmount; 2],
-            #[serde(default, serialize_with = "super::serde::as_pico::slice::serialize")]
-            pub samt3: &'a [SignedAmount],
-        }
-        let with = T {
-            amt1: vec![
-                Amount::from_pico(1_000_000_000),
-                Amount::from_pico(2_000_000_000),
+    fn ser_der_for_transfer_priority() {
+        let transfer_priorities = vec![
+            TransferPriority::Default,
+            TransferPriority::Unimportant,
+            TransferPriority::Elevated,
+            TransferPriority::Priority,
+        ];
+        assert_tokens(
+            &transfer_priorities,
+            &[
+                Token::Seq { len: Some(4) },
+                Token::U8(0),
+                Token::U8(1),
+                Token::U8(2),
+                Token::U8(3),
+                Token::SeqEnd,
             ],
-            amt2: [
-                Amount::from_pico(3_000_000_000),
-                Amount::from_pico(4_000_000_000),
-            ],
-            amt3: &[
-                Amount::from_pico(5_000_000_000),
-                Amount::from_pico(6_000_000_000),
-            ],
-            samt1: vec![
-                SignedAmount::from_pico(-1_000_000_000),
-                SignedAmount::from_pico(-2_000_000_000),
-            ],
-            samt2: [
-                SignedAmount::from_pico(-3_000_000_000),
-                SignedAmount::from_pico(-4_000_000_000),
-            ],
-            samt3: &[
-                SignedAmount::from_pico(-5_000_000_000),
-                SignedAmount::from_pico(-6_000_000_000),
-            ],
-        };
-        let without = T {
-            amt1: vec![],
-            amt2: [
-                Amount::from_pico(3_000_000_000),
-                Amount::from_pico(4_000_000_000),
-            ], // cannot be empty
-            amt3: &[],
-            samt1: vec![],
-            samt2: [
-                SignedAmount::from_pico(-3_000_000_000),
-                SignedAmount::from_pico(-4_000_000_000),
-            ], // cannot be empty
-            samt3: &[],
-        };
-
-        let expected_with = r#"{"amt1":[1000000000,2000000000],"amt2":[3000000000,4000000000],"amt3":[5000000000,6000000000],"samt1":[-1000000000,-2000000000],"samt2":[-3000000000,-4000000000],"samt3":[-5000000000,-6000000000]}"#;
-        assert_eq!(serde_json::to_string(&with).unwrap(), expected_with);
-
-        let expected_without = r#"{"amt1":[],"amt2":[3000000000,4000000000],"amt3":[],"samt1":[],"samt2":[-3000000000,-4000000000],"samt3":[]}"#;
-        assert_eq!(serde_json::to_string(&without).unwrap(), expected_without);
-    }
-
-    #[cfg(feature = "serde")]
-    #[test]
-    fn serde_as_pico_vec_deserialize() {
-        use serde_crate::Deserialize;
-
-        #[derive(Deserialize, PartialEq, Debug, Eq)]
-        #[serde(crate = "serde_crate")]
-        struct T {
-            #[serde(
-                default,
-                deserialize_with = "super::serde::as_pico::vec::deserialize_amount"
-            )]
-            pub amt1: Vec<Amount>,
-            #[serde(
-                default,
-                deserialize_with = "super::serde::as_pico::vec::deserialize_amount"
-            )]
-            pub amt2: Vec<Amount>,
-
-            #[serde(
-                default,
-                deserialize_with = "super::serde::as_pico::vec::deserialize_signed_amount"
-            )]
-            pub samt1: Vec<SignedAmount>,
-            #[serde(
-                default,
-                deserialize_with = "super::serde::as_pico::vec::deserialize_signed_amount"
-            )]
-            pub samt2: Vec<SignedAmount>,
-        }
-
-        let t = T {
-            amt1: vec![Amount(1_000)],
-            amt2: vec![],
-            samt1: vec![SignedAmount(-1_000)],
-            samt2: vec![],
-        };
-
-        let t_str = r#"{"amt1": [1000], "amt2": [], "samt1": [-1000], "samt2": []}"#;
-        let t_from_str: T = serde_json::from_str(t_str).unwrap();
-        assert_eq!(t_from_str, t);
-    }
-
-    #[cfg(feature = "serde")]
-    #[test]
-    fn serde_as_pico_vec_deserialize_invalid_amounts_error() {
-        use serde_crate::Deserialize;
-
-        #[derive(Deserialize, PartialEq, Debug, Eq)]
-        #[serde(crate = "serde_crate")]
-        struct T {
-            #[serde(
-                default,
-                deserialize_with = "super::serde::as_pico::vec::deserialize_amount"
-            )]
-            pub amt: Vec<Amount>,
-
-            #[serde(
-                default,
-                deserialize_with = "super::serde::as_pico::vec::deserialize_signed_amount"
-            )]
-            pub samt: Vec<SignedAmount>,
-        }
-
-        let t_str = r#"{"amt": [], "samt": [18446744073709551615]}"#;
-        let t: Result<T, serde_json::Error> = serde_json::from_str(t_str);
-        let t_err = t.unwrap_err();
-        assert!(t_err.is_data());
-        assert_eq!(
-            t_err.to_string(),
-            "invalid value: integer `18446744073709551615`, expected i64 at line 1 column 41"
-        );
-
-        let t_str = r#"{"amt": [], "samt": 1}"#;
-        let t: Result<T, serde_json::Error> = serde_json::from_str(t_str);
-        let t_err = t.unwrap_err();
-        assert!(t_err.is_data());
-        assert_eq!(
-            t_err.to_string(),
-            "invalid type: integer `1`, expected a Vec<i64> at line 1 column 21"
-        );
-
-        let t_str = r#"{"amt": [-1000], "samt": []}"#;
-        let t: Result<T, serde_json::Error> = serde_json::from_str(t_str);
-        let t_err = t.unwrap_err();
-        assert!(t_err.is_data());
-        assert_eq!(
-            t_err.to_string(),
-            "invalid value: integer `-1000`, expected u64 at line 1 column 14"
-        );
-
-        let t_str = r#"{"amt": 1, "samt": []}"#;
-        let t: Result<T, serde_json::Error> = serde_json::from_str(t_str);
-        let t_err = t.unwrap_err();
-        assert!(t_err.is_data());
-        assert_eq!(
-            t_err.to_string(),
-            "invalid type: integer `1`, expected a Vec<u64> at line 1 column 9"
         );
     }
 
-    #[cfg(feature = "serde")]
     #[test]
-    fn serde_as_xmr() {
-        use serde_crate::{Deserialize, Serialize};
-        use serde_json;
-
-        #[derive(Serialize, Deserialize, PartialEq, Debug)]
-        #[serde(crate = "serde_crate")]
-        struct T {
-            #[serde(with = "super::serde::as_xmr")]
-            pub amt: Amount,
-            #[serde(with = "super::serde::as_xmr")]
-            pub samt: SignedAmount,
-        }
-
-        let orig = T {
-            amt: Amount::from_pico(9_000_000_000_000_000_001),
-            samt: SignedAmount::from_pico(-9_000_000_000_000_000_001),
-        };
-
-        let json = "{\"amt\": \"9000000.000000000001\", \
-                   \"samt\": \"-9000000.000000000001\"}";
-        let t: T = serde_json::from_str(json).unwrap();
-        assert_eq!(t, orig);
-
-        let value: serde_json::Value = serde_json::from_str(json).unwrap();
-        assert_eq!(t, serde_json::from_value(value).unwrap());
-
-        // errors
-        let t: Result<T, serde_json::Error> =
-            serde_json::from_str("{\"amt\": \"1000000.0000000000001\", \"samt\": \"1\"}");
-        assert!(t
-            .unwrap_err()
-            .to_string()
-            .contains(&ParsingError::TooPrecise.to_string()));
-        let t: Result<T, serde_json::Error> =
-            serde_json::from_str("{\"amt\": \"-1\", \"samt\": \"1\"}");
-        assert!(t
-            .unwrap_err()
-            .to_string()
-            .contains(&ParsingError::Negative.to_string()));
-    }
-
-    #[cfg(feature = "serde")]
-    #[test]
-    fn serde_as_xmr_opt() {
-        use serde_crate::{Deserialize, Serialize};
-        use serde_json;
-
-        #[derive(Serialize, Deserialize, PartialEq, Debug, Eq)]
-        #[serde(crate = "serde_crate")]
-        struct T {
-            #[serde(default, with = "super::serde::as_xmr::opt")]
-            pub amt: Option<Amount>,
-            #[serde(default, with = "super::serde::as_xmr::opt")]
-            pub samt: Option<SignedAmount>,
-        }
-
-        let with = T {
-            amt: Some(Amount::from_pico(2_500_000_000_000)),
-            samt: Some(SignedAmount::from_pico(-2_500_000_000_000)),
-        };
-        let without = T {
-            amt: None,
-            samt: None,
-        };
-
-        // Test Roundtripping
-        for s in [&with, &without].iter() {
-            let v = serde_json::to_string(s).unwrap();
-            let w: T = serde_json::from_str(&v).unwrap();
-            assert_eq!(w, **s);
-        }
-
-        let t: T = serde_json::from_str("{\"amt\": \"2.5\", \"samt\": \"-2.5\"}").unwrap();
-        assert_eq!(t, with);
-
-        let t: T = serde_json::from_str("{}").unwrap();
-        assert_eq!(t, without);
-
-        let value_with: serde_json::Value =
-            serde_json::from_str("{\"amt\": \"2.5\", \"samt\": \"-2.5\"}").unwrap();
-        assert_eq!(with, serde_json::from_value(value_with).unwrap());
-
-        let value_without: serde_json::Value = serde_json::from_str("{}").unwrap();
-        assert_eq!(without, serde_json::from_value(value_without).unwrap());
-    }
-
-    #[cfg(feature = "serde")]
-    #[test]
-    fn serde_as_xmr_slice_serialize() {
-        use serde_crate::Serialize;
-
-        #[derive(Serialize, PartialEq, Debug, Eq)]
-        #[serde(crate = "serde_crate")]
-        struct T<'a> {
-            #[serde(default, serialize_with = "super::serde::as_xmr::slice::serialize")]
-            pub amt1: Vec<Amount>,
-            #[serde(default, serialize_with = "super::serde::as_xmr::slice::serialize")]
-            pub amt2: [Amount; 2],
-            #[serde(default, serialize_with = "super::serde::as_xmr::slice::serialize")]
-            pub amt3: &'a [Amount],
-
-            #[serde(default, serialize_with = "super::serde::as_xmr::slice::serialize")]
-            pub samt1: Vec<SignedAmount>,
-            #[serde(default, serialize_with = "super::serde::as_xmr::slice::serialize")]
-            pub samt2: [SignedAmount; 2],
-            #[serde(default, serialize_with = "super::serde::as_xmr::slice::serialize")]
-            pub samt3: &'a [SignedAmount],
-        }
-        let with = T {
-            amt1: vec![
-                Amount::from_pico(1_000_000_000),
-                Amount::from_pico(2_000_000_000),
-            ],
-            amt2: [
-                Amount::from_pico(3_000_000_000),
-                Amount::from_pico(4_000_000_000),
-            ],
-            amt3: &[
-                Amount::from_pico(5_000_000_000),
-                Amount::from_pico(6_000_000_000),
-            ],
-            samt1: vec![
-                SignedAmount::from_pico(-1_000_000_000),
-                SignedAmount::from_pico(-2_000_000_000),
-            ],
-            samt2: [
-                SignedAmount::from_pico(-3_000_000_000),
-                SignedAmount::from_pico(-4_000_000_000),
-            ],
-            samt3: &[
-                SignedAmount::from_pico(-5_000_000_000),
-                SignedAmount::from_pico(-6_000_000_000),
-            ],
-        };
-        let without = T {
-            amt1: vec![],
-            amt2: [
-                Amount::from_pico(3_000_000_000),
-                Amount::from_pico(4_000_000_000),
-            ], // cannot be empty
-            amt3: &[],
-            samt1: vec![],
-            samt2: [
-                SignedAmount::from_pico(-3_000_000_000),
-                SignedAmount::from_pico(-4_000_000_000),
-            ], // cannot be empty
-            samt3: &[],
-        };
-
-        let expected_with = r#"{"amt1":["0.001000000000","0.002000000000"],"amt2":["0.003000000000","0.004000000000"],"amt3":["0.005000000000","0.006000000000"],"samt1":["-0.001000000000","-0.002000000000"],"samt2":["-0.003000000000","-0.004000000000"],"samt3":["-0.005000000000","-0.006000000000"]}"#;
-        assert_eq!(serde_json::to_string(&with).unwrap(), expected_with);
-
-        let expected_without = r#"{"amt1":[],"amt2":["0.003000000000","0.004000000000"],"amt3":[],"samt1":[],"samt2":["-0.003000000000","-0.004000000000"],"samt3":[]}"#;
-        assert_eq!(serde_json::to_string(&without).unwrap(), expected_without);
-    }
-
-    #[cfg(feature = "serde")]
-    #[test]
-    fn serde_as_xmr_vec_deserialize() {
-        use serde_crate::Deserialize;
-
-        #[derive(Deserialize, PartialEq, Debug, Eq)]
-        #[serde(crate = "serde_crate")]
-        struct T {
-            #[serde(
-                default,
-                deserialize_with = "super::serde::as_xmr::vec::deserialize_amount"
-            )]
-            pub amt1: Vec<Amount>,
-            #[serde(
-                default,
-                deserialize_with = "super::serde::as_xmr::vec::deserialize_amount"
-            )]
-            pub amt2: Vec<Amount>,
-
-            #[serde(
-                default,
-                deserialize_with = "super::serde::as_xmr::vec::deserialize_signed_amount"
-            )]
-            pub samt1: Vec<SignedAmount>,
-            #[serde(
-                default,
-                deserialize_with = "super::serde::as_xmr::vec::deserialize_signed_amount"
-            )]
-            pub samt2: Vec<SignedAmount>,
-        }
-
-        let t = T {
-            amt1: vec![Amount(1_000_000)],
-            amt2: vec![],
-            samt1: vec![SignedAmount(-1_000_000)],
-            samt2: vec![],
-        };
-
-        let t_str = r#"{"amt1": ["0.000001"], "amt2": [], "samt1": ["-0.000001"], "samt2": []}"#;
-        let t_from_str: T = serde_json::from_str(t_str).unwrap();
-        assert_eq!(t_from_str, t);
-    }
-
-    #[cfg(feature = "serde")]
-    #[test]
-    fn serde_as_xmr_vec_deserialize_invalid_amounts_error() {
-        use serde_crate::Deserialize;
-
-        #[derive(Deserialize, PartialEq, Debug, Eq)]
-        #[serde(crate = "serde_crate")]
-        struct T {
-            #[serde(
-                default,
-                deserialize_with = "super::serde::as_xmr::vec::deserialize_amount"
-            )]
-            pub amt: Vec<Amount>,
-
-            #[serde(
-                default,
-                deserialize_with = "super::serde::as_xmr::vec::deserialize_signed_amount"
-            )]
-            pub samt: Vec<SignedAmount>,
-        }
-
-        // `samt` is a vector of `SignedAmount`, and `SignedAmount` holds a `i64`.
-        // `18446744073709551615` is the largest value of a `u64` can hold (see https://doc.rust-lang.org/std/u64/constant.MAX.html),
-        // and thus a `i64` cannot hold this value, so an error must happen when deserializing (note that any value greater than
-        // 9_223_372_036_854_775_807 could be used to trigger the error - as per https://doc.rust-lang.org/std/i64/constant.MAX.html)
-        // Another way to see that is that no `u64` to `i64` casting is happenning, which would
-        // cause overflow wrapping, causing wrong representation.
-        let t_str = r#"{"amt": [], "samt": ["18446744073709551615"]}"#;
-        let t: Result<T, serde_json::Error> = serde_json::from_str(t_str);
-        let t_err = t.unwrap_err();
-        assert!(t_err.is_data());
-        assert_eq!(
-            t_err.to_string(),
-            "Amount is too big to fit inside the type at line 1 column 44"
-        );
-
-        let t_str = r#"{"amt": [], "samt": 1}"#;
-        let t: Result<T, serde_json::Error> = serde_json::from_str(t_str);
-        let t_err = t.unwrap_err();
-        assert!(t_err.is_data());
-        assert_eq!(
-            t_err.to_string(),
-            "invalid type: integer `1`, expected a Vec<String> at line 1 column 21"
-        );
-
-        // `amt` is a vector of `Amount`, and `Amount` holds a `u64`, but `-0.001` is a signed value. Like
-        // above, this test makes sure no `i64` to `u64` casting is happening, which would cause
-        // wrong representation.
-        let t_str = r#"{"amt": ["-0.001"], "samt": []}"#;
-        let t: Result<T, serde_json::Error> = serde_json::from_str(t_str);
-        let t_err = t.unwrap_err();
-        assert!(t_err.is_data());
-        assert_eq!(t_err.to_string(), "Amount is negative at line 1 column 18");
-
-        let t_str = r#"{"amt": 1, "samt": []}"#;
-        let t: Result<T, serde_json::Error> = serde_json::from_str(t_str);
-        let t_err = t.unwrap_err();
-        assert!(t_err.is_data());
-        assert_eq!(
-            t_err.to_string(),
-            "invalid type: integer `1`, expected a Vec<String> at line 1 column 9"
+    fn der_for_transfer_priority_error() {
+        assert_de_tokens_error::<TransferPriority>(
+            &[Token::U8(4)],
+            "Invalid variant 4, expected 0-3",
         );
     }
 }
